@@ -1,24 +1,17 @@
+# streamlit_app.py
+import gc
 import os
 import html
 import uuid
-import warnings
-
-# Silence transformers' lazy-module import spam BEFORE rag_engine
-# imports transformers indirectly. Hundreds of "Accessing `__path__`
-# from .models.X.image_processing_X" warnings otherwise.
-warnings.filterwarnings("ignore", message=r"Accessing `__path__` from .*")
-warnings.filterwarnings(
-    "ignore", message=r".*alias will be removed in future versions.*")
-warnings.filterwarnings("ignore", message=r"`torch_dtype` is deprecated.*")
 
 import streamlit as st
 
-_LOCAL_EMBED_PATH = r"C:\codes\models\all-MiniLM-L6-v2"
+_LOCAL_EMBED_PATH = "/home/arapte/models/all-MiniLM-L6-v2"
 if os.path.isdir(_LOCAL_EMBED_PATH):
     os.environ.setdefault("EMBED_MODEL", _LOCAL_EMBED_PATH)
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_HOME", r"C:\codes\hf_cache")
+os.environ.setdefault("HF_HOME", "/home/arapte/.cache/huggingface")
 
 from rag_pipeline import answer_question, sanitize_answer_for_display
 from runtime_settings import settings
@@ -80,48 +73,14 @@ def _vram_stats():
         return None
 
 
-def _count_tokens_for(text: str) -> int:
-    rt = getattr(ENGINE_MANAGER, "answer_runtime", None)
-    t = text or ""
-    try:
-        return int(rt.count_tokens(t)) if rt is not None else max(0, len(t) // 4)
-    except Exception:
-        return max(0, len(t) // 4)
-
-
 def _session_metrics(user_key: str) -> dict:
     state = ENGINE_MANAGER.store.load(user_key)
-    summary = state.get("rolling_summary", "") or ""
     return {
         "session_id": user_key,
         "turn_count": len(state.get("turns", []) or []),
-        "summary_len": len(summary),
-        "summary_tokens": _count_tokens_for(summary),
+        "summary_len": len(state.get("rolling_summary", "") or ""),
         "retrieval_confidence": str(state.get("retrieval_confidence", "") or ""),
     }
-
-
-def _render_token_counters(token_usage: dict) -> None:
-    tu = token_usage if isinstance(token_usage, dict) else {}
-    ctx_total = int(tu.get("context_total", 0) or 0)
-    gen_total = int(tu.get("generated", 0) or 0)
-    if not tu or (ctx_total == 0 and gen_total == 0):
-        return  # canned-answer turn — no model call, nothing to count
-    bd = tu.get("context_breakdown", {}) or {}
-    c1, c2 = st.columns(2)
-    c1.metric("Context tokens (input)", f"{ctx_total:,}")
-    c2.metric("Answer tokens (output)", f"{gen_total:,}")
-    if bd:
-        st.caption(
-            "Context breakdown — "
-            f"papers {bd.get('retrieved_papers', 0)}, "
-            f"summary {bd.get('rolling_summary', 0)}, "
-            f"turns {bd.get('recent_turns', 0)}, "
-            f"memory {bd.get('conversation_memory', 0)}, "
-            f"instructions {bd.get('instructions', 0)}, "
-            f"question {bd.get('question', 0)} "
-            f"(approx by section; measured input total {ctx_total:,})"
-        )
 
 
 def _render_graph(g: dict, graph_key: str = "g") -> None:
@@ -187,8 +146,6 @@ st.title("Syracuse Research Assistant")
 if "user_key" not in st.session_state:
     st.session_state["user_key"] = str(uuid.uuid4())
 USER_KEY = st.session_state["user_key"]
-st.session_state.setdefault("cum_context_tokens", 0)
-st.session_state.setdefault("cum_answer_tokens", 0)
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -206,15 +163,8 @@ with st.sidebar:
         st.session_state["messages"] = []
         _safe_call(hard_reset_memory, USER_KEY)
         st.session_state["user_key"] = str(uuid.uuid4())
-        st.session_state["cum_context_tokens"] = 0
-        st.session_state["cum_answer_tokens"] = 0
         st.success("Conversation restarted — models will reload on next question.")
         st.rerun()
-
-    # ── Retrieval mode (additive) ───────────────────────────────
-    rag_mode = st.radio(
-        "Retrieval mode", ["full", "memory", "off"], index=0, key="rag_mode_select",
-        help="full = papers + memory · memory = memory only (no DB) · off = model only")
 
     st.divider()
 
@@ -256,95 +206,25 @@ with st.sidebar:
     # ── Answer Model ──────────────────────────────────────────────────────
     st.subheader("Answer Model")
 
-    # ── API Keys ──────────────────────────────────────────────────────────
-    # API keys — entered here (not at app start) so the user can flip
-    # API models on without restarting. Stored in session_state and
-    # pushed to os.environ for the engine to pick up via os.getenv().
-    _API_KEYS = [
-        ("OpenAI",    "OPENAI_API_KEY",    "sk-...",    "Used for GPT-4o, GPT-4o mini, o1, o3, o4."),
-        ("Anthropic", "ANTHROPIC_API_KEY", "sk-ant-...", "Used for Claude Opus / Sonnet / Haiku."),
-    ]
-    with st.expander("API Keys (for remote models)", expanded=False):
-        st.caption("Keys are stored in this browser session only — not persisted to disk. "
-                   "Pre-set env vars in the shell to skip this.")
-        for _label, _envvar, _ph, _help in _API_KEYS:
-            _state_key = f"{_envvar}_input"
-            if _state_key not in st.session_state:
-                st.session_state[_state_key] = os.getenv(_envvar, "")
-            _new = st.text_input(f"{_label} API key", value=st.session_state[_state_key],
-                                 type="password", placeholder=_ph, help=_help,
-                                 key=f"{_envvar}_widget")
-            if _new != st.session_state[_state_key]:
-                st.session_state[_state_key] = _new
-                if _new:
-                    os.environ[_envvar] = _new
-                elif _envvar in os.environ:
-                    del os.environ[_envvar]
-
-    _has_openai_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    _has_anthropic_key = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
-
-    # Model options — (label, key, need_gb, kind). Kind 'local' goes through
-    # ModelRuntime; 'api' routes to APIModelRuntime. The model key for API
-    # entries IS the API model identifier; add a row to extend.
-    _MODEL_OPTIONS_FULL = [
-        ("LLaMA 3.2 3B",            "llama-3.2-3b",  4.5,  "local"),
-        ("LLaMA 3.1 8B (4-bit)",    "llama-3.1-8b",  8.5,  "local"),
-        ("Gemma 4 E2B (4-bit)",     "gemma-4-e2b",   4.5,  "local"),
-        ("Gemma 4 E4B (4-bit)",     "gemma-4-e4b",   6.5,  "local"),
-        ("Qwen 2.5 14B (4-bit)",    "qwen-2.5-14b", 12.0,  "local"),
-        ("Gemma 4 26B-A4B (4-bit)", "gemma-4-26b",  16.5,  "local"),
-        ("GPT-OSS 20B (4-bit)",     "gpt-oss-20b",  14.5,  "local"),
-        ("Gemma 4 31B (4-bit)",     "gemma-4-31b",  19.5,  "local"),
-        ("GPT-4o (API)",            "gpt-4o",        0.0,  "api"),
-        ("GPT-4o mini (API)",       "gpt-4o-mini",   0.0,  "api"),
-        ("Claude Opus 4.7 (API)",   "claude-opus-4-7",        0.0, "api"),
-        ("Claude Opus 4.6 (API)",   "claude-opus-4-6",        0.0, "api"),
-        ("Claude Sonnet 4.6 (API)", "claude-sonnet-4-6",      0.0, "api"),
-        ("Claude Haiku 4.5 (API)",  "claude-haiku-4-5-20251001", 0.0, "api"),
-    ]
-
-    _vram_total_gb = 0.0
-    if torch.cuda.is_available():
-        try:
-            _vram_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        except Exception:
-            pass
-    _allow_oversized = os.getenv("RAG_ALLOW_OVERSIZED_MODELS", "0").lower() in {"1", "true", "yes"}
-    _vram_borderline = float(os.getenv("RAG_VRAM_BORDERLINE_GB", "4.0"))
-
-    _MODEL_OPTIONS: dict = {}
-    _hidden_models: list = []
-    for label, key, need_gb, kind in _MODEL_OPTIONS_FULL:
-        if kind == "api":
-            _is_openai = key.startswith(("gpt-", "o1", "o3", "o4"))
-            _has_key = _has_openai_key if _is_openai else _has_anthropic_key
-            _MODEL_OPTIONS[label if _has_key else f"{label} 🔑 no key set"] = key
-            continue
-        # Local: VRAM filter (GPU>=need → fit, +borderline_gb → CPU offload, else hidden)
-        if _vram_total_gb <= 0 or _allow_oversized or need_gb <= _vram_total_gb:
-            _MODEL_OPTIONS[label] = key
-        elif need_gb <= _vram_total_gb + _vram_borderline:
-            _MODEL_OPTIONS[f"{label} ⚠ slow (CPU offload)"] = key
-        else:
-            _hidden_models.append(f"{label} (needs ~{need_gb:.1f} GB)")
-
-    if _hidden_models and not _allow_oversized:
-        st.caption(f"Hidden (won't fit on {_vram_total_gb:.1f} GB GPU): "
-                   + ", ".join(_hidden_models)
-                   + ".  Set RAG_ALLOW_OVERSIZED_MODELS=1 to show anyway.")
-
+    _MODEL_OPTIONS = {
+        "LLaMA 3.2 3B":              "llama-3.2-3b",
+        "LLaMA 3.1 8B (native)":      "llama-3.1-8b",
+        "Gemma 4 E2B (native)":       "gemma-4-e2b",
+        "Gemma 4 E4B (native)":       "gemma-4-e4b",
+        "Gemma 4 26B-A4B (native)":   "gemma-4-26b",
+        "Gemma 4 31B (native)":       "gemma-4-31b",
+        "Qwen 2.5 14B (native)":      "qwen-2.5-14b",
+        "GPT-OSS 20B (native)":       "gpt-oss-20b",
+        "LLaMA 3.3 70B (native)":     "llama-3.3-70b",
+    }
     _model_labels = list(_MODEL_OPTIONS.keys())
 
     if "active_model" not in st.session_state:
         current_key = getattr(settings, "answer_model_key", "llama-3.2-3b")
         st.session_state["active_model"] = next(
             (lbl for lbl, k in _MODEL_OPTIONS.items() if k == current_key),
-            _model_labels[0] if _model_labels else "LLaMA 3.2 3B")
-
-    # Fall back to first option if previously-selected got filtered out
-    if st.session_state["active_model"] not in _model_labels and _model_labels:
-        st.session_state["active_model"] = _model_labels[0]
+            _model_labels[0],
+        )
 
     selected_model_label = st.selectbox(
         "Answer model",
@@ -356,7 +236,7 @@ with st.sidebar:
 
     if selected_model_label != st.session_state["active_model"]:
         new_model_key = _MODEL_OPTIONS[selected_model_label]
-        # Skip reload if already loaded under a different alias
+        # Guard: skip reload if already loaded under a different alias
         already_loaded = (
             ENGINE_MANAGER.active_answer_model_key == new_model_key
             and ENGINE_MANAGER.answer_runtime is not None
@@ -364,26 +244,24 @@ with st.sidebar:
         if not already_loaded:
             settings.answer_model_key = new_model_key
             settings.llm_model = new_model_key
-            # EngineManager handles close+gc+empty_cache; don't double up.
-            _previous_label = st.session_state["active_model"]
+            try:
+                mgr = ENGINE_MANAGER
+                if mgr.answer_runtime is not None:
+                    mgr.answer_runtime.close()
+                    mgr.answer_runtime = None
+                    mgr.active_answer_model_key = ""
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
             st.session_state["active_model"] = selected_model_label
             with st.spinner(f"Loading **{selected_model_label}**..."):
                 try:
                     ENGINE_MANAGER.switch_answer_model(new_model_key)
                     st.success(f"**{selected_model_label}** loaded and ready.")
                 except Exception as e:
-                    # Failed load: roll back to previous selection
                     st.error(f"Failed to load {selected_model_label}: {e}")
-                    st.session_state["active_model"] = _previous_label
-                    _prev_key = _MODEL_OPTIONS.get(_previous_label, "")
-                    if _prev_key:
-                        try:
-                            settings.answer_model_key = _prev_key
-                            settings.llm_model = _prev_key
-                            ENGINE_MANAGER.switch_answer_model(_prev_key)
-                            st.info(f"Rolled back to **{_previous_label}**.")
-                        except Exception as _restore_err:
-                            st.error(f"Rollback to {_previous_label} also failed: {_restore_err}")
             st.rerun()
         else:
             st.session_state["active_model"] = selected_model_label
@@ -419,13 +297,10 @@ def _refresh_sidebar(user_key: str) -> None:
 
     metrics = _session_metrics(user_key)
     diagnostics_placeholder.json({
-        "session_id":                   metrics["session_id"],
-        "turn_count":                   metrics["turn_count"],
-        "summary_len":                  metrics["summary_len"],
-        "rolling_summary_tokens":       metrics["summary_tokens"],
-        "retrieval_confidence":         metrics["retrieval_confidence"],
-        "session_context_tokens_total": int(st.session_state.get("cum_context_tokens", 0)),
-        "session_answer_tokens_total":  int(st.session_state.get("cum_answer_tokens", 0)),
+        "session_id":           metrics["session_id"],
+        "turn_count":           metrics["turn_count"],
+        "summary_len":          metrics["summary_len"],
+        "retrieval_confidence": metrics["retrieval_confidence"],
     })
 
 
@@ -448,8 +323,6 @@ for idx, msg in enumerate(st.session_state["messages"]):
             timing_caption = msg.get("timing_caption", "")
             if timing_caption:
                 st.caption(timing_caption)
-
-            _render_token_counters(msg.get("token_usage", {}) or {})
 
             sources = msg.get("sources", [])
             if sources:
@@ -482,7 +355,6 @@ if prompt:
                 user_key=USER_KEY,
                 use_graph=True,
                 stateless=False,
-                rag_mode=st.session_state.get("rag_mode_select", "full"),
             )
 
         answer_text = (out.get("answer") or "").strip()
@@ -497,17 +369,10 @@ if prompt:
         timing = out.get("timing_ms", {}) if isinstance(out.get("timing_ms"), dict) else {}
         timing_caption = (
             f"LLM calls — answer: {llm_calls.get('answer_llm_calls', 0)} | "
+            f"utility: {llm_calls.get('utility_llm_calls', 0)} | "
             f"total: {timing.get('total_ms', 0):.0f} ms"
         )
         st.caption(timing_caption)
-
-        # Token counters: context (input) vs answer (output)
-        _tu = out.get("token_usage", {}) if isinstance(out.get("token_usage"), dict) else {}
-        st.session_state["cum_context_tokens"] = (
-            int(st.session_state.get("cum_context_tokens", 0)) + int(_tu.get("context_total", 0) or 0))
-        st.session_state["cum_answer_tokens"] = (
-            int(st.session_state.get("cum_answer_tokens", 0)) + int(_tu.get("generated", 0) or 0))
-        _render_token_counters(_tu)
 
         # Sources
         sources = list(out.get("sources", []) or [])[:10]
@@ -527,7 +392,6 @@ if prompt:
         "role": "assistant",
         "content": answer_text,
         "timing_caption": timing_caption,
-        "token_usage": _tu,
         "sources": sources,
         "graph": g,
         "graph_error": out.get("graph_error", ""),

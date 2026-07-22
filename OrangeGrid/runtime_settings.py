@@ -1,60 +1,59 @@
+# runtime_settings.py
 import os
 from dataclasses import dataclass
-
+ 
 _SENTINEL = object()
-
-
+ 
+ 
 def _env(name: str, default: str) -> str:
     v = os.getenv(name)
     return v.strip() if isinstance(v, str) and v.strip() else default
-
+ 
 def _env_int(name: str, default: int) -> int:
     try: return int(_env(name, str(default)))
     except Exception: return int(default)
-
+ 
 def _env_float(name: str, default: float) -> float:
     try: return float(_env(name, str(default)))
     except Exception: return float(default)
-
+ 
 def _env_bool(name: str, default: bool) -> bool:
     return _env(name, "1" if default else "0").lower() in {"1", "true", "yes", "y", "on"}
-
-
+ 
+ 
 @dataclass
 class RuntimeSettings:
     # Core
     active_mode: str = _env("RAG_ACTIVE_MODE", "full")
     llm_model: str = _env("RAG_LLM_MODEL", "llama-3.2-3b")
-    use_graph: bool = _env_bool("RAG_USE_GRAPH", True)
+    use_graph: bool = _env_bool("RAG_USE_GRAPH", False)
     stateless_default: bool = _env_bool("RAG_STATELESS_DEFAULT", False)
     debug_rag: bool = _env_bool("RAG_DEBUG", True)
     force_gpu: bool = _env_bool("RAG_FORCE_GPU", True)
-
-    # ── RAG modes (additive; defaults reproduce existing behavior) ──────
-    rag_mode: str = _env("RAG_MODE", "full")                  # "off" | "memory" | "full"
-    nodb_off_keep_recent_turns: int = _env_int("RAG_NODB_OFF_KEEP_RECENT_TURNS", 1)
-
+ 
     # Generation
     answer_max_new_tokens: int = _env_int("RAG_ANSWER_MAX_NEW_TOKENS", _env_int("RAG_MAX_NEW_TOKENS", 1024))
-    # Floor on generated tokens for LOCAL models. 0 = off (default). Small
-    # models (e.g. Llama-3.2-3B) sometimes emit EOS after ~2 sentences and
-    # trail off with "..."; set e.g. 256 to force a fuller answer. Trade-off:
-    # it also pads genuine "insufficient info" replies, so keep it modest.
-    answer_min_new_tokens: int = _env_int("RAG_ANSWER_MIN_NEW_TOKENS", 0)
     llm_timeout_s: int = _env_int("RAG_LLM_TIMEOUT_S", 300)
     prompt_doc_text_limit: int = _env_int("RAG_PROMPT_DOC_TEXT_LIMIT", 600)
     prompt_max_docs: int = _env_int("RAG_PROMPT_MAX_DOCS", 16)
-
+ 
     # Search
     search_k: int = _env_int("RAG_SEARCH_K", 60)
     search_fetch_k: int = _env_int("RAG_SEARCH_FETCH_K", 150)
     mmr_lambda: float = _env_float("RAG_MMR_LAMBDA", 0.6)
-
+ 
     # Budgets
     budget_memory: int = _env_int("RAG_BUDGET_MEMORY", 900)
     budget_papers: int = _env_int("RAG_BUDGET_PAPERS", 20000)
     trigger_tokens: int = _env_int("RAG_TRIGGER_TOKENS", 6000)
-
+ 
+    # Memory
+    memory_max_per_session: int = _env_int("RAG_MEMORY_MAX_PER_SESSION", 500)
+    memory_prune_target: int = _env_int("RAG_MEMORY_PRUNE_TARGET", 420)
+    memory_persist_every_n_adds: int = _env_int("RAG_MEMORY_PERSIST_EVERY_N_ADDS", 25)
+    memory_extract_first_turn: bool = _env_bool("RAG_MEMORY_EXTRACT_FIRST_TURN", True)
+    qa_cache_enable: bool = _env_bool("RAG_QA_CACHE_ENABLE", False)
+ 
     # Retrieval tuning
     retrieval_dual_query: bool = _env_bool("RAG_RETRIEVAL_DUAL_QUERY", True)
     retrieval_keyword_min_term_len: int = _env_int("RAG_RETRIEVAL_KEYWORD_MIN_TERM_LEN", 3)
@@ -70,7 +69,7 @@ class RuntimeSettings:
     low_conf_prompt_max_docs: int = _env_int("RAG_LOW_CONF_PROMPT_MAX_DOCS", 10)
     low_conf_prompt_doc_text_limit: int = _env_int("RAG_LOW_CONF_PROMPT_DOC_TEXT_LIMIT", 450)
     low_conf_ner_context_max_docs: int = _env_int("RAG_LOW_CONF_NER_CONTEXT_MAX_DOCS", 6)
-
+ 
     # Follow-up detection
     followup_pronoun_regex: str = _env("RAG_FOLLOWUP_PRONOUN_REGEX",
         r"\b(him|her|them|they|it|this|that|those|these|he|she|his|hers|their|there)\b")
@@ -83,72 +82,56 @@ class RuntimeSettings:
         "about,again,also,anything,anyone,can,could,does,else,field,give,help,him,her,it,its,"
         "know,me,more,need,other,others,please,tell,that,them,they,those,this,what,which,who,whom,why,work")
     generic_token_min_len: int = _env_int("RAG_GENERIC_TOKEN_MIN_LEN", 3)
-
+ 
     # NER / Summary
     ner_context_max_docs: int = _env_int("RAG_NER_CONTEXT_MAX_DOCS", 18)
     summary_max_chars: int = _env_int("RAG_SUMMARY_MAX_CHARS", 1400)
     summary_max_items_per_field: int = _env_int("RAG_SUMMARY_MAX_ITEMS_PER_FIELD", 6)
     summary_recent_turns_keep: int = _env_int("RAG_SUMMARY_RECENT_TURNS_KEEP", 8)
     recent_turns_in_prompt: int = _env_int("RAG_RECENT_TURNS_IN_PROMPT", 2)
-
+ 
     # Rewrite
     rewrite_enable: bool = _env_bool("RAG_REWRITE_ENABLE", True)
     rewrite_timeout_s: int = _env_int("RAG_REWRITE_TIMEOUT_S", 10)
     rewrite_max_recent_turns: int = _env_int("RAG_REWRITE_MAX_RECENT_TURNS", 3)
     rewrite_max_chars: int = _env_int("RAG_REWRITE_MAX_CHARS", 220)
-
-    # Deterministic retrieval ranking
+ 
+    # Rerank
+    rerank_enable: bool = _env_bool("RAG_RERANK_ENABLE", False)
+    rerank_candidate_k: int = _env_int("RAG_RERANK_CANDIDATE_K", 30)
+    rerank_final_k: int = _env_int("RAG_RERANK_FINAL_K", 12)
+    rerank_timeout_s: int = _env_int("RAG_RERANK_TIMEOUT_S", 12)
     rerank_w_token: float = _env_float("RAG_RERANK_W_TOKEN", 1.0)
     rerank_w_person: float = _env_float("RAG_RERANK_W_PERSON", 3.0)
     rerank_w_anchor: float = _env_float("RAG_RERANK_W_ANCHOR", 2.0)
     rerank_w_chunk: float = _env_float("RAG_RERANK_W_CHUNK", 0.5)
     rerank_surname_penalty: float = _env_float("RAG_RERANK_SURNAME_PENALTY", 0.6)
     fulltext_fallback_enable: bool = _env_bool("RAG_FULLTEXT_FALLBACK_ENABLE", True)
-
-    # Person retrieval: metadata→fulltext fallback + canonical-name resolution
-    person_min_metadata_docs: int = _env_int("RAG_PERSON_MIN_METADATA_DOCS", 3)
-    researcher_resolve_scan_limit: int = _env_int("RAG_RESEARCHER_RESOLVE_SCAN_LIMIT", 400)
-
-    # Full-text answer generation (only used on follow-up / "more info" requests) + similarity
-    fulltext_max_chunks_per_paper: int = _env_int("RAG_FULLTEXT_MAX_CHUNKS_PER_PAPER", 0)  # 0 = all chunks
-    fulltext_prompt_max_docs: int = _env_int("RAG_FULLTEXT_PROMPT_MAX_DOCS", 120)
-    similar_papers_k: int = _env_int("RAG_SIMILAR_PAPERS_K", 12)
-
+ 
     # Models
     answer_model_key: str = _env("RAG_ANSWER_MODEL_KEY", "llama-3.2-3b")
+    utility_model_key: str = _env("RAG_UTILITY_MODEL_KEY", "llama-3.2-1b")
     llama_1b_path: str = _env("LLAMA_1B", _env("RAG_LLAMA_1B_PATH", ""))
     llama_8b_path: str = _env("LLAMA_8B", _env("RAG_LLAMA_8B_PATH", ""))
-    gemma_4_e2b_path: str = _env("GEMMA_4_E2B", _env("RAG_GEMMA_4_E2B_PATH", r"C:\codes\models\gemma-4-E2B-it"))
-    gemma_4_e4b_path: str = _env("GEMMA_4_E4B", _env("RAG_GEMMA_4_E4B_PATH", r"C:\codes\models\gemma-4-E4B-it"))
-    gemma_4_26b_path: str = _env("GEMMA_4_26B", _env("RAG_GEMMA_4_26B_PATH", r"C:\codes\models\gemma-4-26B-A4B-it"))
-    gemma_4_31b_path: str = _env("GEMMA_4_31B", _env("RAG_GEMMA_4_31B_PATH", r"C:\codes\models\gemma-4-31B-it"))
-    qwen_14b_path: str = _env("QWEN_14B", _env("RAG_QWEN_14B_PATH", r"C:\codes\models\Qwen2.5-14B-Instruct"))
-    gpt_oss_20b_path: str = _env("GPT_OSS_20B", _env("RAG_GPT_OSS_20B_PATH", r"C:\codes\models\gpt-oss-20b"))
-    quantize_8bit: bool = _env_bool("RAG_QUANTIZE_8BIT", True)
-
-    # VRAM / memory budget for model loader (max_memory + offload)
-    kv_reserve_gb_default: float = _env_float("RAG_KV_RESERVE_GB", 2.5)
-    kv_reserve_gb_big_model: float = _env_float("RAG_KV_RESERVE_GB_BIG", 3.5)
-    cpu_budget_fraction: float = _env_float("RAG_CPU_BUDGET_FRACTION", 0.60)
-    big_model_tags: str = _env("RAG_BIG_MODEL_TAGS", "31b,27b,26b,20b,14b")
-
-    # API runtime
-    api_smoke_test: bool = _env_bool("RAG_API_SMOKE_TEST", True)
-
-    # Paper anchor matching thresholds
-    paper_anchor_min_quoted_len: int = _env_int("RAG_PAPER_ANCHOR_MIN_QUOTED_LEN", 12)
-    paper_anchor_scan_limit: int = _env_int("RAG_PAPER_ANCHOR_SCAN_LIMIT", 200)
-    paper_anchor_vec_k: int = _env_int("RAG_PAPER_ANCHOR_VEC_K", 8)
-    paper_anchor_thresh_top1: float = _env_float("RAG_PAPER_ANCHOR_THRESH_TOP1", 0.45)
-    paper_anchor_thresh_top3: float = _env_float("RAG_PAPER_ANCHOR_THRESH_TOP3", 0.60)
-    paper_anchor_thresh_other: float = _env_float("RAG_PAPER_ANCHOR_THRESH_OTHER", 0.72)
-
+    gemma_4_e2b_path: str = _env("GEMMA_4_E2B", _env("RAG_GEMMA_4_E2B_PATH", "/home/arapte/models/gemma-4-E2B-it"))
+    gemma_4_e4b_path: str = _env("GEMMA_4_E4B", _env("RAG_GEMMA_4_E4B_PATH", "/home/arapte/models/gemma-4-E4B-it"))
+    gemma_4_26b_path: str = _env("GEMMA_4_26B", _env("RAG_GEMMA_4_26B_PATH", "/home/arapte/models/gemma-4-26B-A4B-it"))
+    gemma_4_31b_path: str = _env("GEMMA_4_31B", _env("RAG_GEMMA_4_31B_PATH", "/home/arapte/models/gemma-4-31B-it"))
+    qwen_14b_path: str = _env("QWEN_14B", _env("RAG_QWEN_14B_PATH", "/home/arapte/models/Qwen2.5-14B-Instruct"))
+    gpt_oss_20b_path: str = _env("GPT_OSS_20B", _env("RAG_GPT_OSS_20B_PATH", "/home/arapte/models/gpt-oss-20b"))
+    quantize_8bit: bool = _env_bool("RAG_QUANTIZE_8BIT", False)
+    utility_max_new_tokens: int = _env_int("RAG_UTILITY_MAX_NEW_TOKENS", 256)
+    utility_queue_max: int = _env_int("RAG_UTILITY_QUEUE_MAX", 2000)
+    enable_utility_background: int = _env_int("RAG_ENABLE_UTILITY_BACKGROUND", 1)
+    enable_llm_summary_regen: bool = _env_bool("RAG_ENABLE_LLM_SUMMARY_REGEN", False)
+    allow_utility_concurrency: bool = _env_bool("RAG_ALLOW_UTILITY_CONCURRENCY", False)
+ 
     # Session
     session_turns_keep: int = _env_int("RAG_SESSION_TURNS_KEEP", 24)
     session_turns_max_chars: int = _env_int("RAG_SESSION_TURNS_MAX_CHARS", 32000)
     session_turn_trim_target_chars: int = _env_int("RAG_SESSION_TURN_TRIM_TARGET_CHARS", 24000)
     summary_compress_threshold_chars: int = _env_int("RAG_SUMMARY_COMPRESS_THRESHOLD_CHARS", 1400)
-
+ 
     # Topic-pivot / dangling-pronoun handling
     person_pronoun_regex: str = _env("RAG_PERSON_PRONOUN_REGEX",
         r"\b(he|she|him|her|his|hers|they|them|their)\b")
@@ -162,7 +145,7 @@ class RuntimeSettings:
         "followup_phrases", "followup_pronoun_regex",
         "person_pronoun_regex",
     })
-
+ 
     def __setattr__(self, name: str, value: object) -> None:
         old = getattr(self, name, _SENTINEL)
         super().__setattr__(name, value)
@@ -172,6 +155,6 @@ class RuntimeSettings:
                 bust_caches(name)
             except Exception:
                 pass
-
-
+ 
+ 
 settings = RuntimeSettings()

@@ -1,3 +1,4 @@
+#rag_utils.py
 import hashlib
 import re
 from datetime import datetime, timezone
@@ -222,45 +223,6 @@ def is_followup_coref_question(question: str) -> bool:
     lowered = q.lower()
     return any(key and key in lowered for key in get_followup_phrases())
  
-_DEFAULT_CONTINUATION_TERMS = frozenset({
-    "continue", "continued", "continuing", "continuation", "more", "go",
-    "going", "on", "keep", "proceed", "elaborate", "expand", "further",
-    "furthermore", "next", "again", "also", "additionally", "yes", "yeah",
-    "ok", "okay", "please", "and", "then",
-})
-
-def get_continuation_terms():
-    """Discourse/continuation tokens that carry no retrieval topic. Configurable
-    via settings.continuation_terms (set or comma-separated string); falls back
-    to a sensible default so no dataclass change is required."""
-    raw = getattr(settings, "continuation_terms", "")
-    if isinstance(raw, (set, frozenset, list, tuple)):
-        terms = {str(t).strip().lower() for t in raw if str(t).strip()}
-    elif isinstance(raw, str) and raw.strip():
-        terms = {t.strip().lower() for t in raw.split(",") if t.strip()}
-    else:
-        terms = set()
-    return frozenset(terms) if terms else _DEFAULT_CONTINUATION_TERMS
-
-def is_continuation_query(question: str) -> bool:
-    """True when a query has no substantive (topic-bearing) tokens — e.g.
-    "continue", "go on", "more", "keep going". Such a turn is a follow-up on the
-    prior topic, NOT a fresh search string. Detection is token-based (stopwords +
-    generic terms + continuation terms), not a hardcoded per-word branch."""
-    q = (question or "").strip()
-    if not q:
-        return False
-    toks = tokenize_words(q)
-    if not toks:
-        return False
-    cont = get_continuation_terms()
-    for t in toks:
-        tl = t.lower()
-        if tl in cont or is_generic_query_token(tl):
-            continue
-        return False  # a real, topic-bearing token -> not a continuation
-    return True
-
 def bust_caches(changed_field: str) -> None:
     global _GENERIC_QUERY_TERMS_CACHE, _FOLLOWUP_PHRASES_CACHE
     global _FOLLOWUP_PRONOUN_PATTERN_CACHE, _FOLLOWUP_PRONOUN_PATTERN_READY
@@ -365,39 +327,13 @@ def _extract_summary_from_page_content(page_content: str) -> str:
     if stop:
         after = after[:stop.start()]
     return collapse_whitespace(clean_html(after.strip()))
-
-def _extract_fulltext_from_page_content(page_content: str) -> str:
-    """Extract the Fulltext section from the stored document text.
-
-    chroma_ingest.py embeds documents as:
-        Paper ID: ...  Researcher: ...  Title: ...
-        Summary:\n<summary text>
-        Fulltext (<col>):\n<fulltext>
-
-    The Summary extractor above deliberately stops at the Fulltext header, so
-    the body is never surfaced by build_compact_context unless this is used.
-    Returns everything after the 'Fulltext (...):' marker. Empty string when
-    the chunk has no Fulltext header (e.g. abstract-only papers, or body
-    continuation chunks 2+ which are handled by the snippet path instead)."""
-    text = str(page_content or "")
-    if not text:
-        return ""
-    m = re.search(r"(?im)^Fulltext\b[^\n:]*:\s*", text)
-    if not m:
-        return ""
-    after = text[m.end():]
-    return collapse_whitespace(clean_html(after.strip()))
  
 def build_compact_context(docs: List[Any], max_docs: Optional[int] = None,
-                          text_limit: Optional[int] = None,
-                          include_fulltext: bool = False,
-                          fulltext_limit: Optional[int] = None) -> str:
+                          text_limit: Optional[int] = None) -> str:
     if max_docs is None:
         max_docs = int(getattr(settings, "prompt_max_docs", 24))
     if text_limit is None:
         text_limit = int(getattr(settings, "prompt_doc_text_limit", 800))
-    if fulltext_limit is None:
-        fulltext_limit = max(int(text_limit), 1600)
  
     def _researcher_sort_key(d):
         meta = getattr(d, "metadata", None) or {}
@@ -425,15 +361,6 @@ def build_compact_context(docs: List[Any], max_docs: Optional[int] = None,
         snippet = ""
         if not summary_text:
             snippet = clean_snippet(meta, page_content, limit=text_limit)
-
-        # Depth turns: surface the stored Fulltext section (chunk-1 docs)
-        # that the summary extractor stops short of. Body-continuation
-        # chunks (2+) have no Fulltext header and fall through to snippet.
-        fulltext_text = ""
-        if include_fulltext:
-            _ft = _extract_fulltext_from_page_content(page_content)
-            if _ft and len(_ft) > 10:
-                fulltext_text = truncate_text(_ft, fulltext_limit)
  
         researcher_key = researcher.lower().strip() if researcher else ""
         if researcher_key and researcher_key != (last_researcher or ""):
@@ -450,7 +377,6 @@ def build_compact_context(docs: List[Any], max_docs: Optional[int] = None,
             f"primary_topic: {clean_html(str(meta.get('primary_topic', '') or ''))}"
                 if meta.get("primary_topic") else None,
             f"summary: {summary_text}" if summary_text else None,
-            f"fulltext: {fulltext_text}" if fulltext_text else None,
             f"snippet: {clean_html(snippet)}" if snippet else None,
         ]
         blocks.append("\n".join(ln for ln in lines if ln is not None))

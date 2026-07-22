@@ -1,0 +1,52 @@
+# benchmark_retry.sub  —  re-run only the permutations that failed in the
+# previous run. Same resource requests / Argus opt-in as benchmark_parallel.sub.
+#
+# Usage:
+#   RUN_TAG=$(date +%Y%m%d_%H%M%S)
+#   condor_submit benchmark_retry.sub -append "run_tag = ${RUN_TAG}_retry"
+#
+# The 16 permutations below are the ones that failed in run 20260420_191502:
+#   - 14 failed with "sqlite3.OperationalError: disk I/O error"
+#     (now fixed by per-job RAG_STATE_DB on /tmp scratch)
+#   - 2 timed out at 9900s (70B × full, 31B × full)
+#     (now fixed by RAG_LLM_TIMEOUT_S=600 → 19200s cap)
+
+universe   = vanilla
+executable = /home/arapte/rag_cluster/run_one_permutation.sh
+arguments  = "$(model_key) $(db_key) $(run_tag)"
+should_transfer_files = no
+
+output = bench_parallel.$(run_tag).$(model_key).$(db_key).$(cluster).$(process).out
+error  = bench_parallel.$(run_tag).$(model_key).$(db_key).$(cluster).$(process).err
+log    = bench_parallel.$(run_tag).$(cluster).log
+
+request_gpus   = 1
+request_cpus   = 4
+request_memory = 64GB
+request_disk   = 20GB
+
+requirements = (CUDAGlobalMemoryMb >= 81000)
+
++wantsArgusNode    = True
++request_gpus      = 1
++JobMaxSuspendTime = 0
++IsBenchmarkJob    = true
+
+queue model_key, db_key from (
+    llama-3.2-3b      openalex
+    gemma-4-e2b       full
+    gemma-4-e2b       openalex
+    gemma-4-e2b       abstracts
+    llama-3.1-8b      full
+    llama-3.1-8b      openalex
+    qwen-2.5-14b      full
+    gpt-oss-20b       full
+    gpt-oss-20b       openalex
+    gpt-oss-20b       abstracts
+    gemma-4-26b       full
+    gemma-4-26b       openalex
+    gemma-4-26b       abstracts
+    gemma-4-31b       full
+    gemma-4-31b       openalex
+    llama-3.3-70b     full
+)
