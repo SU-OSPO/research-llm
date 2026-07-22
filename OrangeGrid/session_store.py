@@ -22,7 +22,7 @@ _DEFAULT_ROLLING_SUMMARY = (
     "Current focus:\n- (none)\n"
     "Core entities:\n- (none)\n"
     "Key themes:\n- (none)\n"
-    # "Constraints:\n- Use only retrieved Syracuse corpus context.\n"
+    "Constraints:\n- Use only retrieved Syracuse corpus context.\n"
     "Open questions:\n- (none)"
 )
 

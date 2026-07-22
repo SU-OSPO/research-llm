@@ -52,14 +52,15 @@ os.environ.setdefault("RAG_EMBED_DEVICE", "cpu")
 os.environ.setdefault("RAG_LLM_TIMEOUT_S", "300")
 
 MODELS: Dict[str, str] = {
-    "llama-3.2-3b":   "LLaMA 3.2 3B",
-    "llama-3.1-8b":   "LLaMA 3.1 8B (4-bit)",
-    "gemma-4-e2b":    "Gemma 4 E2B (4-bit)",
-    "gemma-4-e4b":    "Gemma 4 E4B (4-bit)",
-    "gemma-4-26b":    "Gemma 4 26B-A4B (4-bit)",
-    "gemma-4-31b":    "Gemma 4 31B (4-bit)",
-    "qwen-2.5-14b":   "Qwen 2.5 14B (4-bit)",
-    "gpt-oss-20b":    "GPT-OSS 20B (4-bit)",
+    "llama-3.2-3b":   "LLaMA 3.2 3B (native)",
+    "llama-3.1-8b":   "LLaMA 3.1 8B (native)",
+    "gemma-4-e2b":    "Gemma 4 E2B (native)",
+    "gemma-4-e4b":    "Gemma 4 E4B (native)",
+    "gemma-4-26b":    "Gemma 4 26B-A4B (native)",
+    "gemma-4-31b":    "Gemma 4 31B (native)",
+    "qwen-2.5-14b":   "Qwen 2.5 14B (native)",
+    "gpt-oss-20b":    "GPT-OSS 20B (native)",
+    "llama-3.3-70b":   "LLaMA 3.3 70B (native)",
 }
 
 DATABASES: Dict[str, str] = {
@@ -193,6 +194,7 @@ class SessionLogger:
             },
             "llm_calls": {
                 "answer": int(llm_calls.get("answer_llm_calls", 0) or 0),
+                "utility": int(llm_calls.get("utility_llm_calls", 0) or 0),
             },
             "retrieval": {
                 "doc_count": int(chroma.get("count", 0) or 0),
@@ -594,7 +596,7 @@ def print_answer(result: Dict[str, Any], verbose: bool = False):
         print(f"  Generation:   {t.get('generation_ms', 0):.0f}ms")
         print(f"  Confidence:   {r.get('confidence', '?')}")
         print(f"  Docs matched: {r.get('doc_count', '?')}")
-        print(f"  LLM calls:    answer={lc.get('answer', 0)}")
+        print(f"  LLM calls:    answer={lc.get('answer', 0)}, utility={lc.get('utility', 0)}")
         if q.get("resolved"):
             print(f"  Resolved:     {q['resolved']}")
         if q.get("detected_intent"):

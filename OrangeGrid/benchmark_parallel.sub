@@ -1,0 +1,76 @@
+# benchmark_parallel.sub  —  fixed version
+#
+# One HTCondor job per (model × db) permutation. All 27 jobs target A100 80GB
+# A100s on the Argus/CRUSH partition.
+#
+# Usage:
+#   RUN_TAG=$(date +%Y%m%d_%H%M%S)
+#   condor_submit benchmark_parallel.sub -append "run_tag = ${RUN_TAG}"
+#
+# Fixes applied:
+#   - request_cpus = 4       : tokenizer/retrieval is CPU-bound, 1 is too few
+#   - request_memory = 64GB  : needed for 70B-class models; prior implicit 1MB
+#                              would get slot-enforced if cgroups tighten
+#   - request_disk = 10GB    : leaves room for HF cache + /tmp scratch
+#   - +request_gpus = 1      : workaround for the Argus START expression that
+#                              checks the underscore-named attribute literally
+#   - +wantsArgusNode = True : required to match CRUSH-NODE-* slots
+
+universe   = vanilla
+executable = /home/arapte/rag_cluster/run_one_permutation.sh
+
+arguments  = "$(model_key) $(db_key) $(run_tag)"
+
+should_transfer_files = no
+
+output = bench_parallel.$(run_tag).$(model_key).$(db_key).$(cluster).$(process).out
+error  = bench_parallel.$(run_tag).$(model_key).$(db_key).$(cluster).$(process).err
+log    = bench_parallel.$(run_tag).$(cluster).log
+
+# --- resources --------------------------------------------------------------
+request_gpus   = 1
+request_cpus   = 4
+request_memory = 64GB
+request_disk   = 20GB
+
+# --- match only A100 80GB (81154 MB on this cluster) ------------------------
+requirements = (CUDAGlobalMemoryMb >= 81000)
+
+# --- Argus / CRUSH opt-in + the underscore-attr workaround ------------------
++wantsArgusNode = True
++request_gpus   = 1
+
++JobMaxSuspendTime = 0
++IsBenchmarkJob    = true
+
+# --- 27 permutations: 9 models x 3 databases --------------------------------
+
+queue model_key, db_key from (
+    llama-3.2-3b      full
+    llama-3.2-3b      openalex
+    llama-3.2-3b      abstracts
+    gemma-4-e2b       full
+    gemma-4-e2b       openalex
+    gemma-4-e2b       abstracts
+    gemma-4-e4b       full
+    gemma-4-e4b       openalex
+    gemma-4-e4b       abstracts
+    llama-3.1-8b      full
+    llama-3.1-8b      openalex
+    llama-3.1-8b      abstracts
+    qwen-2.5-14b      full
+    qwen-2.5-14b      openalex
+    qwen-2.5-14b      abstracts
+    gpt-oss-20b       full
+    gpt-oss-20b       openalex
+    gpt-oss-20b       abstracts
+    gemma-4-26b       full
+    gemma-4-26b       openalex
+    gemma-4-26b       abstracts
+    gemma-4-31b       full
+    gemma-4-31b       openalex
+    gemma-4-31b       abstracts
+    llama-3.3-70b     full
+    llama-3.3-70b     openalex
+    llama-3.3-70b     abstracts
+)

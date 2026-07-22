@@ -1,6 +1,6 @@
 # Syracuse Research Assistant
 
-A local retrieval augmented generation application for Syracuse research discovery. The repository ingests paper records from SQLite into Chroma, retrieves and filters evidence, tracks short term conversational state across turns, and serves answers through a Streamlit chat interface. It also includes an optional graph view that turns retrieved papers into a lightweight entity relationship network.
+A local retrieval augmented generation application for Syracuse research discovery. The repository ingests paper records from SQLite into Chroma, retrieves and filters evidence, tracks short term conversational state across turns, and serves answers through a Streamlit chat interface, an interactive terminal chat, or a benchmark harness. It also includes an optional graph view that turns retrieved papers into a lightweight entity relationship network.
 
 This README is intentionally code aware. It explains how the repository works, what each major module does, how the main functions contribute to the pipeline, and how data moves from ingestion to answer generation.
 
@@ -14,20 +14,43 @@ This README is intentionally code aware. It explains how the repository works, w
 6. Retrieval behavior
 7. Data contracts
 8. Setup and local execution
-9. Runtime operations
-10. Strengths and limitations
-11. Recommended next improvements
+9. Running the three entry points
+10. Runtime operations
+11. Strengths and limitations
+12. Recommended next improvements
 
 ## Project summary
 
 At a practical level, the application solves four problems:
 
-1. It converts paper metadata, summaries, and full text stored in SQLite into Chroma documents with normalized metadata.
+1. It converts paper metadata, summaries, and full text stored in SQLite into Chroma documents with normalized metadata, using sentence aware overlapping chunking so that context is preserved at chunk boundaries.
 2. It retrieves relevant paper chunks for a user question, with additional logic for follow ups, person centered questions, anchor stability, and retrieval confidence.
 3. It maintains a rolling summary and recent turns so follow up questions can be resolved without losing topic continuity.
-4. It renders the interaction in Streamlit, including retrieved sources, diagnostics, and an optional relationship graph.
+4. It renders the interaction in three surfaces — Streamlit, an interactive terminal chat, and a benchmark harness — and supports switching between multiple datasets and multiple answer models at runtime.
 
 ## Main capabilities
+
+### Multiple datasets under one UI
+
+Three corpus modes are available at runtime:
+
+1. `full` — the legacy SQLite backed corpus with full paper text, named "Legacy DB" in the UI.
+2. `openalex` — papers ingested from OpenAlex with Docling extracted full text, named "OpenAlex DB".
+3. `abstracts` — OpenAlex records using abstracts only, named "Abstracts Only".
+
+Each mode has its own Chroma directory, Chroma collection, and Neo4j database. Switching datasets in the Streamlit sidebar or via the `/db` command in the terminal chat flips all three together, and the graph config follows the active dataset automatically through `config_graph.get_neo4j_db()`.
+
+### Multiple answer models with 4 bit quantization
+
+Five answer models are available and can be selected at runtime:
+
+1. LLaMA 3.2 3B — runs unquantized on a single consumer GPU.
+2. LLaMA 3.1 8B — loaded in 4 bit.
+3. Gemma 3 12B — loaded in 4 bit.
+4. Qwen 2.5 14B — loaded in 4 bit.
+5. GPT-OSS 20B — loaded in 4 bit.
+
+Model switching is handled by `EngineManager.switch_answer_model()`. When a quantized answer model is loaded and free VRAM falls below a headroom threshold, the engine evicts the utility model to protect answer generation capacity.
 
 ### Retrieval first, generation second
 
@@ -35,30 +58,35 @@ The system is built so retrieval drives the answer path. The prompt instructs th
 
 ### Conversation continuity through anchors
 
-The system tracks a current anchor, which is the dominant subject inferred from recent retrieval and conversation state. Short or pronoun based follow ups can be interpreted relative to that anchor when evidence is strong enough. Anchor validation now checks both the raw user question and the resolved or rewritten question, preventing spurious anchor drift when follow up queries use pronouns.
+The system tracks a current anchor, which is the dominant subject inferred from recent retrieval and conversation state. Short or pronoun based follow ups can be interpreted relative to that anchor when evidence is strong enough. Anchor validation checks both the raw user question and the resolved or rewritten question, preventing spurious anchor drift when follow up queries use pronouns.
 
 ### Weak evidence handling
 
-The code distinguishes between confident retrieval, weak retrieval, and inconsistent retrieval. When evidence quality drops, the prompt is narrowed, the guardrails become stricter, and the pipeline can fall back to safer extractive answers. Confidence downshifting for person queries has been relaxed so that initial format name matches such as D. Brown matching Duncan Brown are treated as strong evidence rather than triggering unnecessary downgrades.
+The code distinguishes between confident retrieval, weak retrieval, and inconsistent retrieval. When evidence quality drops, the prompt is narrowed, the guardrails become stricter, and the pipeline can fall back to safer extractive answers. Confidence downshifting for person queries is calibrated so that initial format name matches such as D. Brown matching Duncan Brown are treated as strong evidence rather than triggering unnecessary downgrades.
 
 ### Citation grounding and hallucination prevention
 
-After the answer model generates a response, the pipeline now validates quoted paper titles against the actual retrieved document set using fuzzy matching. Lines containing fabricated citations that do not match any retrieved paper are stripped before the answer reaches the user. This complements the existing researcher grounding check, which now uses bidirectional name matching to avoid false positives when metadata stores names in initial format.
+After the answer model generates a response, the pipeline validates quoted paper titles against the actual retrieved document set using fuzzy matching. Lines containing fabricated citations that do not match any retrieved paper are stripped before the answer reaches the user. This complements the researcher grounding check, which uses bidirectional name matching to avoid false positives when metadata stores names in initial format.
+
+### Meta query handling
+
+Questions like "how many papers does the corpus contain", "what is the most recent paper", and short commands such as "switch topic" are intercepted before retrieval and answered directly from the active Chroma collection or by clearing state. This avoids wasting a retrieval round on structural questions about the corpus itself.
 
 ### Local friendly runtime behavior
 
-The repository is designed for local model paths, persistent Chroma storage, offline friendly execution, and explicit cache and session reset controls.
+The repository is designed for local model paths, persistent Chroma storage, offline friendly execution, and explicit session reset controls.
 
 ## Repository structure
 
-```text
+```
 .
-|-- cache_manager.py
+|-- benchmark_rag.py
 |-- chroma_ingest.py
 |-- config_full.py
 |-- config_graph.py
 |-- conversation_memory.py
 |-- database_manager.py
+|-- rag_chat.py
 |-- rag_engine.py
 |-- rag_graph.py
 |-- rag_pipeline.py
@@ -70,20 +98,21 @@ The repository is designed for local model paths, persistent Chroma storage, off
 
 ## End to end flow
 
-```mermaid
+```
 flowchart TD
-    U[User submits question in Streamlit] --> UI1[streamlit_app.py appends user message to UI session]
+    U[User submits question] --> UI1[Entry point appends user message]
     UI1 --> P0[rag_pipeline.answer_question]
 
-    P0 --> V1[Validate question and detect meta command cases]
-    V1 --> M1[get_global_manager and runtime settings]
-    M1 --> S1[Load persistent session state from SessionStore]
-    S1 --> S2[Read rolling summary recent turns extra state and current anchor]
-    S2 --> C1[Build state signature and cache inputs]
-    C1 --> C2{Cacheable turn and cached answer exists}
-    C2 -->|yes| RETCACHE[Return cached payload to UI]
-    C2 -->|no| I1[Classify broad intent and summary intent]
+    P0 --> V1[Validate question and check for meta commands like switch topic]
+    V1 --> META{Meta query like how many papers or most recent paper}
+    META -->|yes| METAANS[Answer directly from Chroma collection and return]
+    META -->|no| M1[get_global_manager and runtime settings]
 
+    M1 --> SW1[Switch active dataset and answer model if changed]
+    SW1 --> S1[Load persistent session state from SessionStore]
+    S1 --> S2[Read rolling summary recent turns extra state and current anchor]
+
+    S2 --> I1[Classify broad intent and summary intent]
     I1 --> F1[Detect follow up or coreference query]
     F1 --> F2{Short query pronoun query or follow up phrase}
     F2 -->|yes| A1[Inspect current anchor and rolling summary]
@@ -96,29 +125,27 @@ flowchart TD
     Q1 --> R0[Build retrieval query text]
     Q2 --> R0
 
-    R0 --> R1[rag_engine retrieval path starts]
-    R1 --> R2[Open active Chroma collection for current mode]
-    R2 --> R3[Run vector retrieval with search_k and fetch_k budgets]
+    R0 --> R1[Open active Chroma collection for current mode]
+    R1 --> R3[Run vector retrieval with search_k and fetch_k budgets]
     R3 --> R4{Dual query or expanded follow up retrieval enabled}
     R4 -->|yes| R5[Run secondary retrieval path and merge candidates]
     R4 -->|no| R6[Continue with initial candidates]
     R5 --> D0
     R6 --> D0
 
-    D0[Deduplicate candidate docs by paper and chunk] --> D1[Build document haystacks and normalize metadata]
+    D0[Deduplicate candidate docs by paper and chunk] --> D1[Build haystacks and normalize metadata]
     D1 --> D2[Filter noisy docs using relevance tokens from the question]
     D2 --> P1{Person centered query detected}
 
     P1 -->|yes| P2[Extract person name from question]
     P2 --> P3[Build name signatures and score docs for person support]
-    P3 --> P4[Rank docs by person match strength]
-    P4 --> P5[Select person focused subset]
+    P3 --> P5[Select person focused subset]
     P5 --> G0
 
     P1 -->|no| G0[Proceed with filtered docs]
 
     G0 --> G1[Analyze metadata dominance across retrieved docs]
-    G1 --> G2[Estimate anchor support ratio across retrieved set]
+    G1 --> G2[Estimate anchor support ratio with fuzzy person name matching]
     G2 --> G3[Assign retrieval confidence label]
     G3 --> G4{Weak or inconsistent retrieval}
 
@@ -127,12 +154,12 @@ flowchart TD
 
     G5 --> AN1[Build candidate anchor from dominance analysis]
     G6 --> AN1
+    AN1 --> AN2[Choose keep replace or ignore anchor using raw and resolved question overlap]
 
-    AN1 --> AN2[Choose whether to keep replace or ignore anchor using raw and resolved question overlap]
-    AN2 --> CTX1[Build rolling summary block for prompt]
-    CTX1 --> CTX2[Build recent turns context block]
-    CTX2 --> CTX3[Build compact context from retrieved docs grouped by researcher]
-    CTX3 --> CTX4[Fit document context to runtime token budget using text first shrink strategy]
+    AN2 --> CTX1[Build rolling summary block]
+    CTX1 --> CTX2[Build recent turns block]
+    CTX2 --> CTX3[Build compact context from docs grouped by researcher]
+    CTX3 --> CTX4[Fit context to token budget with text first shrink strategy]
 
     CTX4 --> PR1[Compose grounded answer prompt]
     PR1 --> LLM1[Invoke answer model with timeout guard]
@@ -141,9 +168,8 @@ flowchart TD
     LLM2 -->|no| FB1[Fallback answer from retrieved docs]
     LLM2 -->|yes| HC1[Strip hallucinated citations not found in retrieved docs]
 
-    HC1 --> SAN1[Sanitize raw answer text]
-    SAN1 --> SAN2[Remove prompt leak labels and process narration]
-    SAN2 --> SAN3{Answer mentions unsupported researchers using bidirectional name matching}
+    HC1 --> SAN1[Sanitize raw answer text and remove prompt leakage]
+    SAN1 --> SAN3{Answer mentions unsupported researchers using bidirectional matching}
     SAN3 -->|yes| FB2[Replace with supported researcher extract answer]
     SAN3 -->|no| SAN4[Keep sanitized answer]
 
@@ -151,36 +177,22 @@ flowchart TD
     FB2 --> OUT1
     SAN4 --> OUT1
 
-    OUT1 --> SUM1[Update rolling summary from question retrieval metadata and answer]
-    SUM1 --> SUM2{LLM summary regeneration enabled}
-    SUM2 -->|yes| SUM3[Optionally regenerate summary with utility model then normalize]
-    SUM2 -->|no| SUM4[Keep deterministic summary update]
-    SUM3 --> ST1[Trim turns sanitize extra state and persist session]
-    SUM4 --> ST1
+    OUT1 --> SUM1[Update rolling summary from question retrieval and answer]
+    SUM1 --> ST1[Trim turns sanitize extra state and persist session]
 
-    ST1 --> ST2[Store updated turns summary anchor and retrieval confidence]
-    ST2 --> GC1{Graph mode enabled}
-    GC1 -->|yes| GC2[rag_graph.graph_retrieve_from_paper_docs]
+    ST1 --> GC1{Graph mode enabled}
+    GC1 -->|yes| GC2[rag_graph.graph_retrieve_from_paper_docs builds in memory graph]
     GC1 -->|no| PKG1[Build output payload without graph]
+    GC2 --> PKG2[Build output payload with graph]
 
-    GC2 --> GC3[Convert retrieved docs to graph hits]
-    GC3 --> GC4[Create paper researcher author and topic nodes]
-    GC4 --> GC5[Create graph edges and graph payload]
-    GC5 --> PKG2[Build output payload with graph]
-
-    PKG1 --> CACHE1{Turn should be cached}
-    PKG2 --> CACHE1
-    CACHE1 -->|yes| CACHE2[Write QA cache and pipeline cache]
-    CACHE1 -->|no| UI2[Return payload to Streamlit]
-    CACHE2 --> UI2
-
-    RETCACHE --> UI3[Streamlit renders cached answer sources and graph if present]
-    UI2 --> UI4[Streamlit renders answer timing diagnostics sources and graph]
+    PKG1 --> UI2[Return payload]
+    PKG2 --> UI2
+    UI2 --> UI4[Streamlit or terminal renders answer timing sources and graph]
 ```
 
 ### Memory and anchor lifecycle
 
-```mermaid
+```
 flowchart LR
     Q[New user turn] --> S[Load rolling summary recent turns current anchor]
     S --> F{Follow up or coreference question}
@@ -195,27 +207,27 @@ flowchart LR
     A4 --> R
 
     R --> D[Compute dominance and retrieval confidence]
-    D --> U[Choose keep replace or clear anchor checking both raw and resolved question]
+    D --> U[Choose keep replace or clear anchor against raw and resolved question]
     U --> T[Trim recent turns]
     T --> RS[Update rolling summary]
-    RS --> P[Persist summary turns anchor and extra state]
+    RS --> P[Persist summary turns anchor and extra state in SQLite]
     P --> NX[Next user turn uses updated state]
 ```
 
 ### Retrieval and fallback decision graph
 
-```mermaid
+```
 flowchart TD
     Q0[Resolved retrieval query] --> R1[Retrieve Chroma candidates]
-    R1 --> R2[Deduplicate and relevance filter docs]
+    R1 --> R2[Deduplicate and relevance filter]
     R2 --> P{Person query}
     P -->|yes| P1[Rank by person support with initial name matching]
     P -->|no| D1[Use filtered docs]
     P1 --> D1
     D1 --> C1[Compute dominance anchor support and confidence]
     C1 --> C2{Confidence high or medium}
-    C2 -->|yes| G1[Use normal prompt limits]
-    C2 -->|no| G2[Use low confidence prompt limits]
+    C2 -->|yes| G1[Normal prompt limits]
+    C2 -->|no| G2[Low confidence prompt limits]
     G1 --> L1[Invoke answer model]
     G2 --> L1
     L1 --> H1[Strip hallucinated citations]
@@ -238,11 +250,15 @@ This script builds the paper retrieval corpus from SQLite and stores it in Chrom
 ### Main responsibilities
 
 1. Read configuration for SQLite, Chroma, embedding model, and chunk sizing.
-2. Detect the actual full text column name in the `works` table.
+2. Detect the actual full text column name in the `works` table, tolerating typos such as `fultext`.
 3. Join research metadata with summary and full text content.
 4. Build one canonical paper document per paper id.
-5. Chunk long paper text into fixed size segments.
-6. Upsert all chunks into a persistent Chroma collection.
+5. Chunk long paper text using a sentence aware overlapping splitter.
+6. Upsert all chunks into a persistent Chroma collection in Chroma safe sub batches of 166.
+
+### Chunking strategy
+
+Chunking is controlled by `CHUNK_MAX_TOKENS` (default 512) and `CHUNK_OVERLAP_TOKENS` (default 128). The splitter first breaks the document into sentences, then greedily packs sentences into a chunk until the token estimate would exceed `CHUNK_MAX_TOKENS`. When a new chunk starts, tail sentences from the previous chunk are carried over up to `CHUNK_OVERLAP_TOKENS` so that context spanning a boundary is not lost. This is mirrored by the pipeline side chunker so retrieval and ingestion stay consistent.
 
 ### Functions
 
@@ -254,9 +270,17 @@ Normalizes metadata values into Chroma safe scalar values. `None` becomes a defa
 
 Extracts a four digit year from a publication date string. If extraction fails, it falls back to a normalized publication date string.
 
-#### `_split_text(text, max_chars=12000)`
+#### `_token_est(text)`
 
-Splits long content into fixed width character chunks. It is simple and deterministic, but not semantic.
+Produces a rough word based token estimate used by the chunker.
+
+#### `_sentence_split(text)`
+
+Splits on sentence terminators to support the sentence aware chunker.
+
+#### `chunk_with_overlap(text)`
+
+Splits text into token bounded chunks with sentence aware overlap as described above.
 
 #### `_join_nonempty(*parts, sep="newline")`
 
@@ -276,7 +300,7 @@ Transforms one database row into a Chroma ready payload consisting of paper id, 
 
 #### `main()`
 
-Orchestrates the full ingestion run. It creates the Chroma client, initializes the embedding function, rebuilds the collection, groups rows by `paper_id`, selects the richest candidate row, chunks long documents, and batch upserts the chunks.
+Orchestrates the full ingestion run. It creates the Chroma client, initializes the embedding function, rebuilds the collection, groups rows by `paper_id`, selects the richest candidate row, chunks it with overlap, and batch upserts the chunks.
 
 ### Important implementation note
 
@@ -284,7 +308,7 @@ Both summary and full text are stored inside `page_content`. This is why later r
 
 ## 2. `config_full.py`
 
-This file provides environment driven defaults for the primary retrieval mode.
+This file provides environment driven defaults for every registered dataset, not just the primary one.
 
 ### Functions
 
@@ -294,17 +318,18 @@ Reads an environment variable and returns a default when it is missing or blank.
 
 ### Important values
 
-1. `SQLITE_DB_FULL` for the SQLite source path
-2. `CHROMA_DIR_FULL` for the Chroma persistence directory
-3. `CHROMA_COLLECTION_FULL` for the collection name
-4. `LLAMA_1B` and `LLAMA_3B` for local model paths
-5. `EMBED_MODEL` for the embedding model path or name
-6. `CHUNK_MAX_CHARS`, `PAPERS_PER_BATCH`, and `CHROMA_MAX_BATCH` for ingestion throughput
-7. `NEO4J_*` values for graph related configuration
+1. `SQLITE_DB_FULL` for the SQLite source path of the legacy corpus
+2. `CHROMA_DIR_FULL`, `CHROMA_COLLECTION_FULL` for the legacy Chroma store
+3. `CHROMA_DIR_OPENALEX`, `CHROMA_COLLECTION_OPENALEX`, `NEO4J_DB_OPENALEX` for the OpenAlex full text dataset
+4. `CHROMA_DIR_ABSTRACTS`, `CHROMA_COLLECTION_ABSTRACTS`, `NEO4J_DB_ABSTRACTS` for the OpenAlex abstracts only dataset
+5. `LLAMA_1B`, `LLAMA_3B`, `LLAMA_8B`, `GEMMA_12B`, `QWEN_14B`, `GPT_OSS_20B` for local model paths
+6. `EMBED_MODEL` for the embedding model path or name
+7. `CHUNK_MAX_CHARS`, `PAPERS_PER_BATCH`, `CHROMA_MAX_BATCH` for ingestion throughput
+8. `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASS`, `NEO4J_DB` for graph configuration
 
 ## 3. `config_graph.py`
 
-This file isolates graph specific configuration.
+This file isolates graph specific configuration and makes the Neo4j database selection follow the active dataset.
 
 ### Functions
 
@@ -312,99 +337,89 @@ This file isolates graph specific configuration.
 
 Same environment lookup pattern as the main config.
 
+#### `get_neo4j_db()`
+
+Returns the Neo4j database name for the currently active dataset. It first tries to read the active `DatabaseManager` through the global engine manager, so switching datasets in the UI also switches the graph DB. It falls back to the static `NEO4J_DB` environment value when the manager has not yet been constructed.
+
 ### Important values
 
 1. `NEO4J_URI`
 2. `NEO4J_USER`
 3. `NEO4J_PASS`
-4. `NEO4J_DB`
+4. `NEO4J_DB` as a static fallback
 5. `GRAPH_TOP_K`
 
-In the provided repository snapshot, `rag_graph.py` builds the graph in memory from retrieved documents rather than querying Neo4j directly, so these settings appear reserved for future or external graph workflows.
+In the provided repository snapshot, `rag_graph.py` builds the graph in memory from retrieved documents rather than querying Neo4j directly, so these settings are reserved for future or external graph workflows.
 
 ## 4. `runtime_settings.py`
 
-This file is the runtime tuning surface of the application. It centralizes search size, prompt size, memory retention, follow up detection, reranking, model choice, and summary behavior.
+This file is the runtime tuning surface of the application. It centralizes search size, prompt size, memory retention, follow up detection, reranking, model choice, rewrite behavior, utility worker behavior, and session persistence.
 
 ### Helper functions
 
-#### `_env(name, default)`
+#### `_env(name, default)`, `_env_int(...)`, `_env_float(...)`, `_env_bool(...)`
 
-String environment lookup.
-
-#### `_env_int(name, default)`
-
-Safe integer parser with fallback.
-
-#### `_env_float(name, default)`
-
-Safe float parser with fallback.
-
-#### `_env_bool(name, default)`
-
-Boolean parser for common truthy string values.
+Typed environment variable readers with safe fallbacks.
 
 ### `RuntimeSettings`
 
-This dataclass holds the active runtime configuration.
+This dataclass holds the active runtime configuration. Field groups and notable fields include:
 
-#### Core runtime fields
+#### Core runtime
 
-1. `active_mode`
-2. `llm_model`
-3. `use_graph`
-4. `stateless_default`
-5. `debug_rag`
-6. `force_gpu`
+`active_mode`, `llm_model`, `use_graph`, `stateless_default`, `debug_rag`, `force_gpu`.
 
-#### Generation and prompt sizing fields
+#### Generation and prompt sizing
 
-1. `answer_max_new_tokens`
-2. `llm_timeout_s`
-3. `prompt_doc_text_limit` — default raised from 500 to 600 to give the budget fitting loop a higher starting ceiling that results in more documents reaching the LLM
-4. `prompt_max_docs` — default raised from 8 to 16 so the budget fitting loop can preserve more documents before shrinking to fit the context window
+`answer_max_new_tokens`, `llm_timeout_s`, `prompt_doc_text_limit`, `prompt_max_docs`.
 
-#### Retrieval sizing fields
+#### Retrieval sizing
 
-1. `search_k`
-2. `search_fetch_k`
-3. `mmr_lambda`
+`search_k`, `search_fetch_k`, `mmr_lambda`.
 
-#### Memory and summary fields
+#### Budgets
 
-1. `memory_max_per_session`
-2. `memory_prune_target`
-3. `memory_persist_every_n_adds`
-4. `summary_max_chars`
-5. `summary_recent_turns_keep`
-6. `recent_turns_in_prompt`
+`budget_memory`, `budget_papers`, `trigger_tokens`.
 
-#### Confidence and follow up fields
+#### Memory
 
-1. `dominant_majority_ratio`
-2. `dominant_min_count`
-3. `dominant_min_confidence`
-4. `retrieval_weak_min_docs`
-5. `anchor_stable_confidence`
-6. `anchor_consistency_min_ratio`
-7. `low_conf_prompt_max_docs` — raised from 6 to 10 so weak or inconsistent retrievals still get enough document context
-8. `low_conf_prompt_doc_text_limit` — raised from 350 to 450 for the same reason
-9. `followup_pronoun_regex`
-10. `followup_phrases`
-11. `followup_query_max_words`
+`memory_max_per_session`, `memory_prune_target`, `memory_persist_every_n_adds`, `memory_extract_first_turn`, `qa_cache_enable`.
 
-#### Reranking and model separation fields
+#### Retrieval tuning
 
-1. `rerank_enable`
-2. `rerank_candidate_k`
-3. `rerank_final_k`
-4. `answer_model_key`
-5. `utility_model_key`
-6. `llama_1b_path`
+`retrieval_dual_query`, `retrieval_keyword_min_term_len`, `retrieval_topic_min_terms`, `dominant_majority_ratio`, `dominant_min_count`, `dominant_min_confidence`, `dominant_replace_confidence`, `metadata_filter_min_results`, `retrieval_weak_min_docs`, `anchor_stable_confidence`, `anchor_consistency_min_ratio`, `low_conf_prompt_max_docs`, `low_conf_prompt_doc_text_limit`, `low_conf_ner_context_max_docs`.
+
+#### Follow up detection
+
+`followup_pronoun_regex`, `followup_phrases`, `followup_query_max_words`, `followup_k_mult`, `followup_fetch_k_mult`, `generic_query_terms`, `generic_token_min_len`.
+
+#### NER and summary
+
+`ner_context_max_docs`, `summary_max_chars`, `summary_max_items_per_field`, `summary_recent_turns_keep`, `recent_turns_in_prompt`.
+
+#### Rewrite
+
+`rewrite_enable`, `rewrite_timeout_s`, `rewrite_max_recent_turns`, `rewrite_max_chars`.
+
+#### Rerank
+
+`rerank_enable`, `rerank_candidate_k`, `rerank_final_k`, `rerank_timeout_s`, `rerank_w_token`, `rerank_w_person`, `rerank_w_anchor`, `rerank_w_chunk`, `rerank_surname_penalty`, `fulltext_fallback_enable`.
+
+#### Models
+
+`answer_model_key`, `utility_model_key`, `llama_1b_path`, `llama_8b_path`, `gemma_12b_path`, `qwen_14b_path`, `gpt_oss_20b_path`, `quantize_8bit` (controls whether large models use 4 bit quantization in the current engine), `utility_max_new_tokens`, `utility_queue_max`, `enable_utility_background`, `enable_llm_summary_regen`, `allow_utility_concurrency`.
+
+#### Session
+
+`session_turns_keep`, `session_turns_max_chars`, `session_turn_trim_target_chars`, `summary_compress_threshold_chars`.
+
+#### Topic pivot and dangling pronoun handling
+
+`person_pronoun_regex`, `topic_inject_min_chars`, `dangling_pronoun_min_injected`, `dangling_pronoun_min_raw_substantive`, `dangling_pronoun_hint_max_chars`.
 
 ### `RuntimeSettings.__setattr__(...)`
 
-Intercepts changes to selected settings and invalidates cached regex or token sets in `rag_utils` when follow up configuration changes. This prevents stale query parsing behavior after live runtime changes.
+Intercepts changes to cache busting fields (`generic_query_terms`, `generic_token_min_len`, `followup_phrases`, `followup_pronoun_regex`, `person_pronoun_regex`) and calls `rag_utils.bust_caches(...)` so cached regexes and token sets are rebuilt on next use. This prevents stale query parsing behavior after live runtime changes.
 
 ### `settings = RuntimeSettings()`
 
@@ -412,17 +427,17 @@ Creates the shared runtime settings instance imported across the codebase.
 
 ## 5. `database_manager.py`
 
-This file abstracts corpus mode selection. The current repository registers one active mode named `full`.
+This file abstracts corpus mode selection. Three modes are registered by default: `full`, `openalex`, and `abstracts`. Each mode carries its own Chroma directory, collection name, Neo4j database name, and human readable display label.
 
 ### Types and functions
 
 #### `DatabaseConfig`
 
-A small dataclass describing one searchable corpus mode with mode name, Chroma directory, collection name, and description.
+Dataclass describing one searchable corpus mode with `mode`, `chroma_dir`, `collection`, `description`, `neo4j_db`, and `display_label`.
 
 #### `DatabaseManager.__init__()`
 
-Creates the registry and registers the default `full` mode.
+Creates the registry and registers the three built in modes.
 
 #### `register_config(name, cfg)`
 
@@ -436,65 +451,37 @@ Resolves a requested mode case insensitively and falls back to the first availab
 
 Makes the resolved mode active.
 
-#### `get_active_config()`
+#### `get_active_config()`, `get_config(name)`, `list_configs()`
 
-Returns the active mode config.
-
-#### `get_config(name)`
-
-Returns a specific mode config.
-
-#### `list_configs()`
-
-Lists registered config names.
+Accessors for active and registered configs.
 
 #### `ensure_dirs_exist()`
 
 Creates configured Chroma directories if they do not already exist.
 
+#### `display_labels()`
+
+Returns the mode to display label mapping used by the sidebar and terminal chat.
+
+#### `get_active_neo4j_db()`
+
+Returns the Neo4j database name for the active config, with fallback to the static `NEO4J_DB`.
+
+#### `validate_active_config()`
+
+Post switch health check. Opens the active Chroma collection and returns a dict with `healthy` and `doc_count`, or a failure reason. The benchmark and terminal chat both use this to warn when a selected dataset is missing or empty.
+
 ## 6. `conversation_memory.py`
 
-This file handles in process answer caching, pipeline caching, and hard reset behavior.
-
-### Internal caches
-
-1. `_QA_CACHE` stores cached answer payloads per user.
-2. `_PIPELINE_CACHE` stores cached pipeline state snapshots.
-3. `_MAX_QA_PER_USER` and `_MAX_USERS` limit memory usage.
+This file is now a thin utility layer that contains only the hard reset entry point.
 
 ### Functions
 
-#### `_evict_oldest_users()`
-
-Applies LRU style eviction across top level caches when user count exceeds limits.
-
-#### `clear_qa_cache(user_key)`
-
-Removes the cached answers for one user and also clears that user's pipeline cache.
-
-#### `get_cached_answer(user_key, key)`
-
-Returns a cached answer payload for a normalized key.
-
-#### `set_cached_answer(user_key, key, payload)`
-
-Stores or updates a cached answer payload and preserves recency ordering.
-
 #### `hard_reset_memory(user_key)`
 
-Performs the strongest memory reset. It tries to reset state through the global engine manager, falls back to direct SQLite session reset when necessary, deletes entries from the Chroma memory collection if present, and clears process level caches.
+Performs the strongest memory reset. It first tries to reset state through the global engine manager. If that fails, it directly resets the `SessionStore` backed SQLite state and then removes any persisted entries for the session from the Chroma memory collection at `RAG_MEMORY_DIR`. All failures are logged but swallowed so a partial reset never throws to the UI.
 
-#### `get_pipeline_cache(user_key)`
-
-Returns the cached pipeline state for the user.
-
-#### `set_pipeline_cache(user_key, data)`
-
-Stores a pipeline snapshot or clears it when the value is falsy.
-
-#### `clear_pipeline_cache(user_key)`
-
-Removes only the pipeline cache entry.
+Note that earlier in project history this file hosted process level QA and pipeline caches. Those have been removed in favor of always fresh retrieval, which simplifies reasoning about correctness and makes the Streamlit sidebar operate with just Reset Memory and Restart Conversation controls.
 
 ## 7. `session_store.py`
 
@@ -509,6 +496,12 @@ The `chat_state` table stores:
 3. `turns_json`
 4. `extra_state_json`
 
+The store automatically performs an ADD COLUMN migration if it finds an older schema without `extra_state_json`.
+
+### Connection strategy
+
+`SessionStore` uses a per thread SQLite connection via `threading.local()`, enables WAL journal mode and `synchronous=NORMAL` pragmas, and wraps writes in `BEGIN IMMEDIATE` transactions so concurrent Streamlit and benchmark workers do not corrupt state.
+
 ### Functions
 
 #### `_safe_json_loads(raw, default)`
@@ -517,7 +510,7 @@ Defensively parses JSON and guarantees the parsed type matches the expected defa
 
 #### `_trim_turns(turns)`
 
-Keeps recent user and assistant turns and trims older turns when character limits are exceeded.
+Keeps recent user and assistant turns and trims older turns when character limits (`session_turns_max_chars`, `session_turn_trim_target_chars`) are exceeded.
 
 #### `_sanitize_anchor(value)`
 
@@ -527,121 +520,25 @@ Normalizes anchor dictionaries before persistence. It ensures the anchor value e
 
 Sanitizes auxiliary state such as anchor details, retrieval confidence, and control flags before storage.
 
-#### `SessionStore`
+#### `SessionStore.load(session_id)` / `save(...)` / `reset(session_id)` / `close()`
 
-Acts as the durable backing store used by the engine and UI for load, save, and reset operations. Its main architectural value is that it decouples long lived conversation state from process level caches.
+Load, save, reset, and per thread connection close. `save` preserves an existing summary and extra state when the caller passes blanks, which matters for meta query paths that should not overwrite continuity state.
 
-## 8. `cache_manager.py`
-
-This file defines cache key construction and cache invalidation helpers.
-
-### Functions
-
-#### `state_signature_from_state(state)`
-
-Builds a compact signature from the current session state so cached answers can be invalidated when relevant context changes.
-
-#### `build_cache_key(...)`
-
-Constructs the key used for answer reuse by combining user identity, resolved query text, state signature, and retrieval sensitive parameters.
-
-#### `should_cache_turn(retrieval_text, rewrite_blocked)`
-
-Determines whether a turn should be cached.
-
-#### `retrieval_cache_summary(docs, retrieval_text, limit_ids=12)`
-
-Builds a compact summary of retrieval output for caching or diagnostics.
-
-#### `_gpu_release()`
-
-Attempts to release cached GPU memory.
-
-#### `clear_cache(...)`
-
-Clears selected cache scopes.
-
-#### `clear_cache_all()`
-
-Clears all managed cache scopes and reports what was removed.
-
-## 9. `rag_utils.py`
+## 8. `rag_utils.py`
 
 This file provides the low level helper functions shared across retrieval, prompt construction, answer cleanup, and anchor logic.
 
 ### Text normalization helpers
 
-#### `norm_text(s)`
-
-Lowercases and normalizes text for comparisons.
-
-#### `clean_html(s)`
-
-Cleans HTML noise from text.
-
-#### `normalize_title_case(s)`
-
-Normalizes title case for display.
-
-#### `collapse_whitespace(s)`
-
-Collapses repeated whitespace.
-
-#### `tokenize_words(s)`
-
-Tokenizes text into word like units.
-
-#### `token_in_hay(token, hay)`
-
-Checks whether a token appears in a searchable text haystack.
+`norm_text`, `clean_html`, `normalize_title_case`, `collapse_whitespace`, `tokenize_words`, `token_in_hay`.
 
 ### Lexical caches and NLTK bootstrap
 
-#### `bootstrap_nltk_data()`
-
-Initializes the NLTK resources needed by entity extraction and stopword handling.
-
-#### `get_stopword_set()`
-
-Returns cached stopwords.
-
-#### `get_english_word_set()`
-
-Returns a cached English vocabulary set.
-
-#### `get_name_token_set()`
-
-Returns a cached personal name token set.
+`bootstrap_nltk_data`, `get_stopword_set`, `get_english_word_set`, `get_name_token_set`, `_wordnet_is_common_word`.
 
 ### Runtime configurable query parsing
 
-#### `_split_config_terms(raw)`
-
-Splits comma separated or delimiter separated config values.
-
-#### `get_generic_query_terms()`
-
-Returns configured generic query terms.
-
-#### `get_followup_phrases()`
-
-Returns configured follow up phrases.
-
-#### `get_followup_pronoun_pattern()`
-
-Compiles and caches the configured pronoun regex.
-
-#### `is_generic_query_token(token)`
-
-Determines whether a token is too generic to guide retrieval.
-
-#### `is_followup_coref_question(question)`
-
-Classifies a query as a likely follow up or coreference question.
-
-#### `bust_caches(changed_field)`
-
-Clears cached regex or token resources when runtime settings change.
+`_split_config_terms`, `get_generic_query_terms`, `get_followup_phrases`, `get_followup_pronoun_pattern`, `get_person_pronoun_pattern`, `is_generic_query_token`, `is_followup_coref_question`, `bust_caches`.
 
 ### Corpus specific cleanup
 
@@ -651,55 +548,19 @@ Removes broad Syracuse terms such as `university`, `faculty`, or `campus` when t
 
 ### Document shaping helpers
 
-#### `dedupe_docs(docs)`
-
-Deduplicates documents by paper and chunk identity.
-
-#### `doc_haystack(d)`
-
-Builds a searchable text haystack from metadata and page content.
-
-#### `truncate_text(text, limit)`
-
-Truncates text, preferring sentence boundaries when possible.
-
-#### `clean_snippet(meta, text, limit=...)`
-
-Builds a cleaner snippet for prompting or display.
-
-#### `_extract_summary_from_page_content(page_content)`
-
-Parses the `Summary:` section from stored Chroma page content. This function is crucial because summaries are stored in the document body rather than metadata.
+`dedupe_docs`, `doc_haystack`, `truncate_text`, `clean_snippet`, `_extract_summary_from_page_content`, `dedupe_ci`.
 
 #### `build_compact_context(docs, max_docs=None, text_limit=None)`
 
-Builds the compact document context block used in prompts from title, researcher, authors, year, primary topic, extracted summary, and fallback snippet. Documents are now sorted by researcher name before context assembly so the LLM sees coherent per researcher clusters, and researcher group separators are inserted when the researcher changes. This prevents the pattern where the model invents placeholder labels like Unknown researcher 1 and Unknown researcher 2 when docs from different people are interleaved.
-
-#### `dedupe_ci(items)`
-
-Case insensitive list deduplication.
+Builds the compact document context block used in prompts from title, researcher, authors, year, primary topic, extracted summary, and fallback snippet. Documents are sorted by researcher name before context assembly so the LLM sees coherent per researcher clusters, and researcher group separators are inserted when the researcher changes. This prevents the pattern where the model invents placeholder labels like "Unknown researcher 1" and "Unknown researcher 2" when docs from different people are interleaved.
 
 ### Anchor and confidence helpers
 
-#### `is_placeholder_anchor_value(value)`
-
-Rejects empty or placeholder anchor values.
-
-#### `normalize_anchor(anchor)`
-
-Normalizes anchor dictionaries into a stable shape.
-
-#### `anchor_in_text(anchor_value, text)`
-
-Checks whether the anchor is supported by a given text.
-
-#### `anchor_is_stable(anchor)`
-
-Determines whether an anchor is stable enough to trust.
+`is_placeholder_anchor_value`, `normalize_anchor`, `anchor_in_text`, `anchor_is_stable`.
 
 #### `anchor_support_ratio(anchor_value, docs)`
 
-Measures how strongly the retrieved set supports the anchor. Now includes fuzzy person name matching so that a full name anchor like Duncan Brown correctly matches documents where the metadata stores the initial format D. Brown. The function first tries exact text matching and falls back to initial plus last name matching across researcher and authors fields.
+Measures how strongly the retrieved set supports the anchor. Includes fuzzy person name matching so that a full name anchor like "Duncan Brown" correctly matches documents whose metadata stores the initial format "D. Brown". The function first tries exact text matching and falls back to initial plus last name matching across researcher and authors fields.
 
 #### `retrieval_confidence_label(docs_count, anchor_consistent)`
 
@@ -707,107 +568,31 @@ Maps retrieval support into confidence labels such as high, medium, weak, or inc
 
 ### Intent and answer cleanup helpers
 
-#### `classify_generic_intent(question)`
+`classify_generic_intent`, `strip_prompt_leak`, `looks_like_person_candidate`, `strip_possessive`, `tokenize_name`, `generate_name_variants`, `split_author_names`, `has_explicit_entity_signal`, `short_hash`, `utcnow_iso`, `is_meta_command`, `anchor_query_overlap`, `query_tokens_for_relevance`.
 
-Classifies a question into broad intents such as default, comparison, time range, or list.
+The name related helpers (`tokenize_name`, `generate_name_variants`, `split_author_names`) produce name signatures that the pipeline and anchor support code use to match across "Duncan Brown", "D. Brown", "Brown, D.", and similar variants.
 
-#### `strip_prompt_leak(answer)`
+## 9. `rag_engine.py`
 
-Removes prompt leakage from generated answers.
-
-#### `looks_like_person_candidate(name)`
-
-Heuristic test for whether a string looks like a person name.
-
-#### `strip_possessive(name)`
-
-Removes possessive endings from names.
-
-#### `has_explicit_entity_signal(question, ents=None)`
-
-Determines whether the question explicitly names an entity.
-
-#### `short_hash(value, length=12)`
-
-Returns a compact hash used in keys.
-
-#### `utcnow_iso()`
-
-Returns a UTC timestamp string.
-
-#### `is_meta_command(question)`
-
-Detects meta commands rather than research questions.
-
-#### `anchor_query_overlap(anchor_value, question)`
-
-Measures whether the current anchor is already reflected in the user query.
-
-#### `query_tokens_for_relevance(question)`
-
-Extracts content bearing query tokens for document filtering.
-
-## 10. `rag_engine.py`
-
-This file is the runtime core. It manages dynamic budgets, model resources, rolling summary construction, entity extraction, query shaping, and access to the global engine manager.
+This file is the runtime core. It manages dynamic resource budgets, model runtimes with quantization and attention backends, rolling summary construction, entity extraction, query shaping, the utility worker for background utility calls, and the global engine manager.
 
 ### Runtime and debug helpers
 
-#### `_ensure_dir(p)`
-
-Creates directories.
-
-#### `_make_local_chroma_client(persist_dir)`
-
-Creates a persistent Chroma client.
-
-#### `_dbg(title, obj=None, limit=2000)`
-
-Conditional debug printer controlled by runtime settings.
+`_ensure_dir`, `_make_local_chroma_client`, `_dbg`.
 
 ### Resource awareness
 
-#### `available_ram_mb()`
+#### `available_ram_mb()` / `available_vram_mb()`
 
-Reports available system RAM.
-
-#### `available_vram_mb()`
-
-Reports available GPU memory when CUDA is available.
+Report available system and GPU memory.
 
 #### `dynamic_budgets()`
 
 Adjusts memory, paper, and token budgets based on current RAM and VRAM conditions. This is a key operational safeguard because it reduces load when resources are tight.
 
-#### `_no_results_summary_line(question)`
-
-Builds a compact marker used when a turn retrieved no useful results.
-
 ### Rolling summary helpers
 
-#### `_summary_template_empty()`
-
-Creates the empty rolling summary scaffold.
-
-#### `_extract_summary_sections(text)`
-
-Parses the rolling summary into structured sections.
-
-#### `_format_summary_sections(sections)`
-
-Serializes structured sections back into normalized summary text.
-
-#### `_clean_answer_for_summary_signal(text)`
-
-Cleans answer text before extracting themes.
-
-#### `_extract_answer_theme_keywords(answer_text, max_items=6)`
-
-Extracts important keywords from the assistant answer while suppressing common filler terms.
-
-#### `_sanitize_entity_values(values, max_items=8)`
-
-Filters noisy or low quality entity values.
+`_summary_template_empty`, `_extract_summary_sections`, `_format_summary_sections`, `_clean_answer_for_summary_signal`, `_extract_answer_theme_keywords`, `_sanitize_entity_values`.
 
 #### `build_rolling_summary(previous_summary, user_question, retrieval_metadata, assistant_answer)`
 
@@ -829,41 +614,7 @@ Optionally asks a utility model to regenerate the rolling summary, then post pro
 
 ### Entity extraction and anchor support
 
-#### `_is_anchor_escape_question(question)`
-
-Detects questions that intentionally move away from the current anchor.
-
-#### `_looks_like_person_token(token)`
-
-Checks whether a token resembles part of a person name.
-
-#### `_extract_entities_regex(raw, max_items=6)`
-
-Regex based entity extraction fallback.
-
-#### `_extract_entities_nltk(raw, max_items=6)`
-
-NLTK based named entity extraction path.
-
-#### `_extract_entities_basic(text, max_items=6)`
-
-Simple backup entity extraction.
-
-#### `_build_ner_context_text(docs, max_docs=12)`
-
-Builds supporting context text from retrieved docs for entity extraction.
-
-#### `_extract_summary_topic_keywords(summary, max_chars=180)`
-
-Extracts topic keywords from the rolling summary.
-
-#### `_summary_query_from_text(summary, max_chars=320)`
-
-Converts summary state into a retrieval oriented query.
-
-#### `_summary_keywords_overlap_anchor(topic_keywords, anchor_value)`
-
-Checks whether summary keywords overlap the current anchor.
+`_is_anchor_escape_question`, `_looks_like_person_token`, `_extract_entities_regex`, `_extract_entities_nltk`, `_extract_entities_basic`, `_build_ner_context_text`, `_extract_summary_topic_keywords`, `_summary_query_from_text`, `_summary_keywords_overlap_anchor`.
 
 #### `_extract_person_name(question)`
 
@@ -871,123 +622,81 @@ Extracts a person name from the user question. This is important because the pip
 
 ### Query shaping and document packing
 
-#### `_answer_is_bad(answer)`
+`_answer_is_bad`, `_extract_focus_from_question`, `_is_invalid_focus_value`, `_query_is_short_or_pronoun`, `_inject_anchor_into_query`, `pack_docs`.
 
-Detects obviously unusable answers.
+### Model runtime
 
-#### `_extract_focus_from_question(question)`
+#### `ModelRuntime`
 
-Extracts likely topical focus from the user question.
+Wraps a Hugging Face model, tokenizer, and generation configuration. It selects between FlashAttention 2, PyTorch SDPA, and eager attention based on what the environment supports and falls back gracefully. Quantization uses 4 bit via `bitsandbytes` for the larger answer models (8B, 12B, 14B, 20B) and unquantized weights for the 3B and 1B models. It provides `close()` so the manager can deterministically free VRAM when switching models.
 
-#### `_is_invalid_focus_value(text)`
+#### `_resolve_llm_path(llm_model_key)` / `_quantize_bits(...)` / `_is_remote_model(...)`
 
-Rejects poor or generic focus candidates.
+Map an internal model key (for example `gemma-3-12b`) to a concrete local path, to its quantization width, and to whether the path refers to a local directory or a Hugging Face Hub identifier.
 
-#### `_query_is_short_or_pronoun(question)`
+#### `build_embeddings()` / `clear_runtime_cache()`
 
-Detects underspecified follow up queries.
+Embedding model construction and a helper to clear cached runtimes.
 
-#### `_inject_anchor_into_query(question, anchor_value)`
+### Utility worker
 
-Adds the current anchor back into a short or pronoun based query to improve retrieval precision.
+#### `UtilityJob` / `UtilityWorker`
 
-#### `pack_docs(docs, budget, count_tokens_fn)`
+Background queue based execution of utility model calls such as query rewriting, rerank scoring, and optional summary regeneration. The worker can be disabled or suppressed when VRAM is tight. It is bounded by `utility_queue_max` to prevent unbounded growth.
 
-Greedily packs documents into the prompt budget.
+### `EngineManager`
 
-#### `build_embeddings()`
+The singleton that owns the `DatabaseManager`, `SessionStore`, embeddings, per mode `Chroma` clients, answer and utility model runtimes, the answer generation lock, and the utility worker.
 
-Creates the embedding model runtime.
+Key methods:
 
-#### `clear_runtime_cache()`
-
-Clears cached model runtimes.
-
-#### `_resolve_llm_path(llm_model_key)`
-
-Maps an internal model key to a concrete local model path.
+1. `get_papers_vs(mode)` — lazily opens and caches the Chroma wrapper for a given mode.
+2. `switch_mode(mode)` — resolves and switches the active dataset in both the manager and the `DatabaseManager`.
+3. `switch_answer_model(llm_model_key)` / `switch_model(...)` — switch answer model, evicting the utility runtime first if the new answer model needs quantization.
+4. `_vram_is_tight()` / `_evict_utility_if_needed()` — VRAM protection. A headroom constant (around 2.5 GB) governs when the utility runtime is unloaded to keep answer generation from thrashing.
+5. `_switch_runtime(...)` — generic runtime swap used by both answer and utility paths.
+6. `reset_session(session_id)` — clears persistent session state and, when appropriate, memory collection entries for one user.
+7. `get_engine(user_key, mode, stateless)` — lazily constructs or returns the per user `Engine` that owns turn level context and retrieval.
 
 #### `get_global_manager()`
 
-Returns the singleton engine manager used by the pipeline and UI.
+Returns the process wide `EngineManager` instance used by the pipeline, the Streamlit UI, the terminal chat, and the benchmark harness.
 
-## 11. `rag_pipeline.py`
+## 10. `rag_pipeline.py`
 
-This file is the main orchestration layer. It connects intent detection, retrieval, dominance analysis, anchor updates, prompt construction, answer generation, hallucination detection, fallback logic, graph generation, caching, and final payload assembly.
+This file is the main orchestration layer. It connects intent detection, meta query handling, retrieval, dominance analysis, anchor updates, prompt construction, answer generation, hallucination detection, fallback logic, graph generation, and final payload assembly.
 
 ### Pipeline config
 
-#### `_env_int(name, default)`
-
-Helper for reading integer environment values.
-
 #### `PIPELINE_CFG`
 
-Dictionary holding pipeline specific runtime settings, including prompt framing, cache versioning, fallback controls, and maximum document counts.
+Dictionary holding pipeline specific runtime settings, including prompt framing, style rules that enforce grounded answers, fallback controls, maximum document counts, and dangling pronoun answer templates.
 
-### Intent helper
+### Intent and meta query helpers
 
 #### `_is_summary_intent(question)`
 
 Detects whether the user wants a summary style answer.
 
+#### `_detect_meta_query(question)`
+
+Recognizes structural questions about the corpus itself, such as "how many papers" and "what is the most recent paper".
+
+#### `_answer_meta_query(meta_type, mgr, effective_mode)`
+
+Answers recognized meta queries directly from the active Chroma collection without invoking the answer model. This keeps meta questions cheap and consistent.
+
 ### Document and metadata helpers
 
-#### `_doc_to_source_md(d)`
-
-Formats a retrieved document into source markdown for the UI.
-
-#### `_doc_to_ref(d)`
-
-Builds a compact internal reference object.
-
-#### `_filter_noisy_docs(docs, question)`
-
-Deduplicates and filters retrieved docs so the final set better reflects the actual question terms.
-
-#### `_normalize_meta_value(value)`
-
-Normalizes metadata values for comparison.
-
-#### `_metadata_key_allowed(key)`
-
-Filters out metadata keys that are not useful for dominance analysis.
-
-#### `_metadata_value_allowed(value)`
-
-Filters out poor metadata values such as placeholders or very short fragments.
-
-#### `_iter_doc_metadata_key_values(d)`
-
-Yields normalized metadata triples from each retrieved document.
+`_doc_to_source_md`, `_doc_to_ref`, `_filter_noisy_docs`, `_normalize_meta_value`, `_metadata_key_allowed`, `_metadata_value_allowed`, `_iter_doc_metadata_key_values`.
 
 ### Person specific retrieval helpers
 
 These functions are among the most important specialized behaviors in the pipeline.
 
-#### `_split_author_names(raw_authors)`
+`_person_name_signatures`, `_name_match_strength`, `_doc_person_match_score`, `_rank_docs_for_person`, `_select_docs_for_person`.
 
-Splits author strings into individual names.
-
-#### `_person_name_signatures(name)`
-
-Builds multiple person name signatures such as full name and initial plus surname so imperfect metadata formatting can still match.
-
-#### `_name_match_strength(text, sig)`
-
-Scores the strength of a signature match inside a text.
-
-#### `_doc_person_match_score(d, person_name)`
-
-Scores how strongly a document supports a person centered query.
-
-#### `_rank_docs_for_person(docs, person_name)`
-
-Ranks documents using person match scores.
-
-#### `_select_docs_for_person(ranked_docs, ...)`
-
-Selects a usable person focused subset from the ranked results. The strong match threshold has been lowered from 3.0 to 2.0 so that initial format name matches such as D. Brown matching Duncan Brown are classified as strong evidence rather than merely matched. This directly prevents the confidence downshift cascade that previously caused sterile extractive answers on first turn person queries.
+`_select_docs_for_person` uses a strong match threshold calibrated so that initial format name matches such as "D. Brown" matching "Duncan Brown" count as strong evidence. This prevents the confidence downshift cascade that previously caused sterile extractive answers on first turn person queries.
 
 ### Confidence and dominance helpers
 
@@ -997,7 +706,7 @@ Lowers a retrieval confidence label.
 
 #### `_downshift_confidence_for_person_support(label, ...)`
 
-Further reduces confidence when person specific evidence is weaker than expected. The downshift thresholds have been relaxed so that retrievals where most documents match by initial plus last name no longer trigger aggressive downgrades. The previous thresholds required a 45 percent strong ratio and 75 percent matched ratio to maintain high confidence, which was too strict for academic metadata where initial format names are the norm. The new thresholds require 30 percent strong and 50 percent matched for high, and only downgrade further when strong evidence is below 10 percent.
+Further reduces confidence only when person specific evidence is weaker than expected. Thresholds are calibrated for academic metadata where initial format names are common.
 
 #### `_dominant_metadata_filter_from_docs(docs, question, ...)`
 
@@ -1005,35 +714,15 @@ Finds a dominant metadata value across retrieved docs that can serve as an ancho
 
 ### User facing fallback answers
 
-#### `_insufficient_context_answer(question, intent)`
-
-Returns a direct answer when retrieval support is too weak.
-
-#### `_uncertain_retrieval_answer(question, anchor_value="", reason="")`
-
-Returns a more explicit uncertainty answer for inconsistent retrieval.
+`_insufficient_context_answer`, `_uncertain_retrieval_answer`.
 
 ### Answer sanitation helpers
 
-#### `_normalize_for_similarity(text)`
-
-Normalizes text for similarity comparison.
-
-#### `_strip_leading_answer_labels(text)`
-
-Removes leading labels such as `Summary:` from generated output.
-
-#### `_is_closure_or_process(text)`
-
-Detects process narration or closing boilerplate.
-
-#### `_sanitize_user_answer(text)`
-
-Removes leakage and undesirable boilerplate from the user facing answer.
+`_normalize_for_similarity`, `_strip_leading_answer_labels`, `_is_closure_or_process`, `_sanitize_user_answer`.
 
 #### `sanitize_answer_for_display(text)`
 
-Applies final display safe cleanup to the answer.
+Applies final display safe cleanup to the answer. The Streamlit app calls this before rendering.
 
 ### Anchor update helpers
 
@@ -1043,43 +732,19 @@ Creates a candidate anchor from dominance analysis.
 
 #### `_choose_anchor_update(current_anchor, candidate_anchor, dominance, question, resolved_question="")`
 
-Decides whether to keep, replace, or ignore the anchor. Now accepts an optional `resolved_question` parameter and validates anchor candidates against both the raw user question and the resolved or rewritten question. This prevents anchor drift where an unrelated researcher from noisy retrieval results would silently become the anchor when the user asked a follow up using pronouns. A new candidate anchor is blocked with action `blocked_no_query_overlap` when it has zero token overlap with both the raw and resolved questions.
+Decides whether to keep, replace, or ignore the anchor. It validates anchor candidates against both the raw user question and the resolved or rewritten question. This prevents anchor drift where an unrelated researcher from noisy retrieval results would silently become the anchor when the user asked a follow up using pronouns. A new candidate anchor is blocked with action `blocked_no_query_overlap` when it has zero token overlap with both the raw and resolved questions.
 
 ### Prompt composition
 
-#### `_extract_answer_text(raw_answer)`
-
-Extracts the final answer body from raw model output.
-
-#### `_runtime_prompt_token_budget(runtime, reserved_new_tokens)`
-
-Computes the prompt token budget available after reserving generation tokens.
-
-#### `_compose_answer_prompt(...)`
-
-Builds the answer prompt from question, summary, recent turns, style hints, and document context.
+`_extract_answer_text`, `_runtime_prompt_token_budget`, `_compose_answer_prompt`.
 
 #### `_fit_prompt_to_budget(...)`
 
-Shrinks document count and context length iteratively so the prompt fits within model limits. The fitting strategy has been revised to use a two phase approach. Phase one shrinks only the per document text limit while preserving document count, since having more documents in the context is more important for answer quality than per document verbosity. Phase two alternates between shrinking documents and text when the text floor has been reached. The iteration count was increased from 28 to 36 and reduction steps were made gentler.
+Shrinks document count and context length iteratively so the prompt fits within model limits. The fitting strategy uses a two phase approach. Phase one shrinks only the per document text limit while preserving document count, since having more documents in the context is more important for answer quality than per document verbosity. Phase two alternates between shrinking documents and text when the text floor has been reached.
 
 ### Prompt context helpers
 
-#### `_clip_sentences(text, max_sentences=2, max_chars=320)`
-
-Clips text while preserving sentence boundaries when possible.
-
-#### `_clean_assistant_turn_for_prompt(text)`
-
-Sanitizes prior assistant turns before reusing them inside prompts.
-
-#### `_rolling_summary_for_prompt(summary_text)`
-
-Normalizes the rolling summary for prompt inclusion.
-
-#### `_build_recent_turns_context(state, max_turns)`
-
-Builds the recent turn history block.
+`_clip_sentences`, `_clean_assistant_turn_for_prompt`, `_rolling_summary_for_prompt`, `_build_recent_turns_context`.
 
 ### Fallback answer synthesis
 
@@ -1087,21 +752,13 @@ Builds the recent turn history block.
 
 Produces a non model fallback answer directly from retrieved docs.
 
-#### `_clean_title_for_answer(title)`
+#### `_supported_researcher_evidence(docs, ...)`
 
-Normalizes titles before fallback display.
-
-#### `_supported_researcher_evidence(docs, max_researchers=6, ...)`
-
-Builds structured researcher evidence from retrieved docs.
-
-#### `_extract_person_like_spans(text, max_items=24)`
-
-Extracts person like spans from generated text.
+Builds structured researcher evidence from retrieved docs, used by the replacement extractive answer when hallucination risk is high.
 
 #### `_answer_mentions_unsupported_researcher(answer, docs)`
 
-Checks whether the answer names researchers not supported by the retrieved evidence. Now uses bidirectional name matching: it checks answer names against document metadata signatures and also checks document names against answer name signatures. This prevents false positives when the answer uses a full name like Duncan Brown but the metadata stores D. Brown. A last name only fallback is also applied so that shared surnames are not flagged as unsupported.
+Checks whether the answer names researchers not supported by the retrieved evidence. Uses bidirectional name matching: it checks answer names against document metadata signatures and also checks document names against answer name signatures. This prevents false positives when the answer uses a full name like "Duncan Brown" but the metadata stores "D. Brown". A last name only fallback is applied so that shared surnames are not flagged as unsupported.
 
 #### `_build_researcher_extract_answer(docs, max_researchers=5)`
 
@@ -1115,11 +772,7 @@ Collects normalized titles from retrieved documents for validation against the g
 
 #### `_strip_hallucinated_citations(answer, docs)`
 
-Removes lines from the generated answer that contain quoted paper titles not found in the retrieved document set. Uses fuzzy matching with a SequenceMatcher ratio threshold of 0.6 to account for minor formatting differences. This catches fabricated citations that the 3B model invents when given insufficient context.
-
-### Dominance usability gate
-
-The `dom_usable` flag that controls whether a targeted second pass retrieval is performed has been simplified. Previously it required the dominance confidence to exceed the replace confidence threshold or the ratio to exceed a separately computed strong floor, which sometimes blocked targeted retrieval even when the dominance detector had already confirmed the result. Now it requires only that `_dominant_metadata_filter_from_docs` returned `dominant=True` and the filter value is not a placeholder.
+Removes lines from the generated answer that contain quoted paper titles not found in the retrieved document set. Uses fuzzy matching with a `SequenceMatcher` ratio threshold to account for minor formatting differences. This catches fabricated citations that small models sometimes invent when given insufficient context.
 
 ### Main entry point
 
@@ -1128,27 +781,29 @@ The `dom_usable` flag that controls whether a targeted second pass retrieval is 
 This is the main application entry point. At a high level it:
 
 1. validates the question
-2. loads engine and session state
-3. resolves graph and stateless behavior
-4. detects follow up status and intent
-5. performs retrieval and optional anchor aware rewrite
-6. filters and analyzes documents
-7. computes confidence and dominance
-8. updates or preserves the anchor using both raw and resolved question overlap
-9. builds a prompt from summary turns and compact context grouped by researcher
-10. invokes the answer model
-11. strips hallucinated citations from the generated answer
-12. sanitizes or replaces weak answers using bidirectional name matching
-13. persists updated state
-14. returns a UI ready result payload
+2. short circuits meta commands (topic reset) and meta queries (corpus stats)
+3. loads engine and session state
+4. switches to the requested dataset and answer model when they have changed
+5. resolves graph and stateless behavior
+6. detects follow up status and intent
+7. performs retrieval and optional anchor aware rewrite
+8. filters and analyzes documents
+9. computes confidence and dominance
+10. updates or preserves the anchor using both raw and resolved question overlap
+11. builds a prompt from summary turns and compact context grouped by researcher
+12. invokes the answer model
+13. strips hallucinated citations from the generated answer
+14. sanitizes or replaces weak answers using bidirectional name matching
+15. persists updated state
+16. returns a UI ready result payload
 
 ### Output assembly
 
 #### `_build_output(...)`
 
-Constructs the final structured response object returned to Streamlit, including answer text, sources, timing, graph, anchor, and retrieval diagnostics.
+Constructs the final structured response object returned to Streamlit and the other entry points, including answer text, sources, timing, graph, anchor, and retrieval diagnostics.
 
-## 12. `rag_graph.py`
+## 11. `rag_graph.py`
 
 This file builds an in memory relationship graph from retrieved paper documents.
 
@@ -1160,7 +815,7 @@ Normalizes values into non null strings.
 
 #### `_split_authors(s, limit=25)`
 
-Splits author strings on commas, semicolons, the word and, or pipes, deduplicates them, and limits output size.
+Splits author strings on commas, semicolons, the word "and", or pipes, deduplicates them, and limits output size.
 
 #### `paper_docs_to_graph_hits(paper_docs, max_papers=40)`
 
@@ -1172,29 +827,15 @@ Creates nodes and edges for papers, researchers, authors, and topics.
 
 #### `graph_retrieve_from_paper_docs(paper_docs, height=650)`
 
-Convenience wrapper that converts retrieved paper docs into graph payload output.
+Convenience wrapper that converts retrieved paper docs into a graph payload.
 
-## 13. `streamlit_app.py`
+## 12. `streamlit_app.py`
 
-This file defines the UI and the operational controls.
+This file defines the Streamlit UI and the operational controls.
 
 ### Utility functions
 
-#### `_safe_call(fn, *args, **kwargs)`
-
-Executes a function and suppresses exceptions.
-
-#### `_esc(value)`
-
-Escapes plain text for safe display.
-
-#### `_esc_answer(value)`
-
-Applies answer specific cleanup before rendering.
-
-#### `_render_graph(g, graph_key)`
-
-Renders the graph payload with Streamlit AGraph.
+`_safe_call`, `_esc`, `_esc_answer`, `_render_graph`.
 
 ### App bootstrap behavior
 
@@ -1202,19 +843,16 @@ On startup the file sets environment variables for local execution, imports the 
 
 ### Sidebar controls
 
-1. Clear Cache
-2. Reset Memory
-3. Restart Conversation
-
-These are not equivalent.
-
-1. Clear Cache removes cached answers and retrieval side state.
-2. Reset Memory clears stored conversational memory for the session id.
-3. Restart Conversation clears transcript, memory, caches, user key, and loaded runtimes.
+1. **System Memory** — live RAM and VRAM usage bars.
+2. **Reset Memory** — clears stored conversational memory for the current session id.
+3. **Restart Conversation** — clears transcript and memory and issues a fresh session id.
+4. **Dataset** — selectbox driven by `DatabaseManager.display_labels()`. Switching flips Chroma and Neo4j together and clears the per mode vector store cache.
+5. **Model** — selectbox listing the five answer models. Switching invokes `EngineManager.switch_answer_model(...)` and shows a spinner while the new model is loaded or re quantized.
+6. **Session Diagnostics** — a JSON block showing `session_id`, `active_dataset`, `chroma_collection`, `neo4j_db`, requested and loaded `answer_model`, attention implementation, GPU name, and session counters such as `turn_count`, `summary_len`, and `retrieval_confidence`.
 
 ### `_refresh_sidebar(user_key)`
 
-Refreshes RAM and VRAM diagnostics and shows session state information such as turn count, summary length, and retrieval confidence.
+Refreshes RAM and VRAM diagnostics and rewrites the session diagnostics JSON.
 
 ### Chat loop behavior
 
@@ -1222,42 +860,96 @@ For each submitted prompt the UI:
 
 1. appends the user message to session state
 2. calls `answer_question(prompt, user_key=USER_KEY, use_graph=True, stateless=False)`
-3. renders the answer
-4. shows timing and model call counts
+3. renders the sanitized answer
+4. shows timing and LLM call counts
 5. shows retrieved sources in an expander
-6. shows graph output when available
+6. shows graph output inside a collapsible toggle
 7. appends the assistant response to chat history
 8. refreshes diagnostics
+
+## 13. `rag_chat.py`
+
+This file is the interactive terminal chat entry point. It is a pure CLI mirror of the Streamlit loop and is useful for headless or remote sessions.
+
+### Startup
+
+Selects a model and database at launch, either via `--model` and `--db` flags or an interactive prompt, then enters a REPL. Every question and answer is saved incrementally to a timestamped JSON log using the same field structure as the benchmark.
+
+### Slash commands
+
+1. `/model <key>` — switch to a different answer model.
+2. `/db <key>` — switch to a different dataset.
+3. `/status` — show current model, database, and session info.
+4. `/reset` — clear conversation memory.
+5. `/stateless` — toggle stateless mode (no conversation history).
+6. `/verbose` — toggle verbose output (timing, retrieval details).
+7. `/history` — show conversation history.
+8. `/log` — show the path to the current session's JSON log.
+9. `/help` — show command reference.
+10. `/quit` or `/exit` — exit the chat.
+
+Color output uses ANSI escapes; input is provided through `readline` so arrow key history works.
+
+## 14. `benchmark_rag.py`
+
+This file runs a full product matrix of answer models against all registered datasets using a fixed question set and writes structured results.
+
+### Design
+
+Every `(model, database)` permutation is executed in its own subprocess. This isolation is intentional: a CUDA device side assert inside one model cannot corrupt the next, and VRAM is fully released between runs. The parent process collects per permutation JSON files and assembles them into one report.
+
+### Output
+
+1. `benchmark_results_YYYYMMDD_HHMMSS.json` — full structured results per permutation and per question.
+2. `benchmark_summary_YYYYMMDD_HHMMSS.txt` — human readable summary table.
+
+### Usage
+
+```
+python benchmark_rag.py
+python benchmark_rag.py --models 3b 8b
+python benchmark_rag.py --databases full
+python benchmark_rag.py --dry-run
+```
+
+The dry run path does not import the pipeline, so it is safe to use for validating the question list and argument parsing without loading models.
 
 ## Retrieval behavior in plain language
 
 ### Normal question path
 
-1. classify the question intent
-2. strip overly generic corpus noise terms if helpful
-3. run Chroma retrieval
-4. deduplicate and filter documents
-5. check whether results cohere around one topic or person
-6. build prompt context from summary recent turns and compact doc context grouped by researcher
-7. invoke the answer model with grounding instructions
-8. strip any hallucinated citations from the answer
+1. Classify the question intent.
+2. Strip overly generic corpus noise terms if helpful.
+3. Run Chroma retrieval against the active dataset.
+4. Deduplicate and filter documents.
+5. Check whether results cohere around one topic or person.
+6. Build prompt context from summary, recent turns, and compact doc context grouped by researcher.
+7. Invoke the answer model with grounding instructions.
+8. Strip any hallucinated citations from the answer.
 
 ### Follow up question path
 
-1. detect short or pronoun based follow up patterns
-2. consult anchor and rolling summary
-3. optionally rewrite or expand the retrieval query with anchor context
-4. retrieve with larger search multipliers when configured
-5. recompute anchor stability and support ratio using fuzzy person name matching before answer generation
-6. validate anchor updates against both raw and resolved questions
+1. Detect short or pronoun based follow up patterns.
+2. Consult anchor and rolling summary.
+3. Optionally rewrite or expand the retrieval query with anchor context.
+4. Retrieve with larger search multipliers when configured.
+5. Recompute anchor stability and support ratio using fuzzy person name matching before answer generation.
+6. Validate anchor updates against both raw and resolved questions.
 
 ### Weak or inconsistent retrieval path
 
-1. downgrade retrieval confidence using relaxed person support thresholds
-2. shrink prompt size to reduce noise using raised low confidence caps
-3. apply stricter anti hallucination guidance
-4. fall back to an extractive answer when synthesis is unsafe
-5. replace answers that mention unsupported researchers using bidirectional name matching
+1. Downgrade retrieval confidence using person support thresholds.
+2. Shrink prompt size to reduce noise using low confidence caps.
+3. Apply stricter anti hallucination guidance.
+4. Fall back to an extractive answer when synthesis is unsafe.
+5. Replace answers that mention unsupported researchers using bidirectional name matching.
+
+### Meta query path
+
+1. Detect a meta query such as "how many papers" or "most recent paper".
+2. Answer directly from the active Chroma collection.
+3. Skip retrieval and the answer model entirely.
+4. Persist the turn so conversation continuity is preserved.
 
 ## Data contracts
 
@@ -1279,11 +971,11 @@ Each ingested chunk typically includes:
 
 ### Session state shape
 
-Persistent session state contains:
+Persistent session state in SQLite contains:
 
-1. rolling summary
-2. recent turns
-3. extra state such as anchor and retrieval confidence
+1. `rolling_summary`
+2. `turns_json` — an array of `{role, text}` objects
+3. `extra_state_json` — anchor, anchor last action, retrieval confidence, last focus, last topic, summary updated flag, rewrite flags, and anchor support ratio
 
 ## Setup and local execution
 
@@ -1292,40 +984,44 @@ Persistent session state contains:
 1. Python 3.10 or newer
 2. SQLite database with `research_info` and `works`
 3. ChromaDB
-4. Streamlit
+4. Streamlit (for the web UI)
 5. Transformers and Torch
-6. Sentence transformer compatible embedding dependencies
-7. LangChain core and Chroma integrations
-8. Optional `streamlit_agraph` for graph rendering
+6. `bitsandbytes` for 4 bit quantization of large models
+7. Sentence transformer compatible embedding dependencies
+8. LangChain core and Chroma integrations
+9. Optional `streamlit_agraph` for graph rendering
+10. Optional `readline` support (standard on Linux and macOS) for the terminal chat
 
 ### Clone the repository
 
-```bash
+```
 git clone <your-repo-url>
-cd <your-repo-folder>
+cd <your-repo-folder>/rag
 ```
 
 ### Create and activate a virtual environment
 
-```bash
+```
 python -m venv .venv
 source .venv/bin/activate
 ```
 
-On Windows, activate the environment with the standard Scripts activate command for your shell.
+On Windows, activate the environment with the standard `Scripts\activate` command for your shell.
 
 ### Install dependencies
 
 If you add a requirements file:
 
-```bash
+```
 pip install -r requirements.txt
 ```
 
 A likely starting point from the visible imports is:
 
-```bash
-pip install streamlit chromadb langchain-core langchain-chroma langchain-huggingface transformers torch psutil tqdm nltk
+```
+pip install streamlit chromadb langchain-core langchain-chroma langchain-huggingface \
+            transformers torch bitsandbytes accelerate psutil tqdm nltk \
+            streamlit-agraph sentence-transformers
 ```
 
 ### Configure the environment
@@ -1336,19 +1032,43 @@ Review and update:
 2. `config_graph.py`
 3. `runtime_settings.py`
 
-The most important values are the SQLite database path, Chroma persistence path, collection name, local model paths, embedding model path, and runtime budget settings.
+The most important values are the SQLite database path, Chroma persistence paths for all three datasets, collection names, Neo4j DB names, local model paths for every answer model you plan to load, the embedding model path, and runtime budget settings.
 
 ### Build the Chroma index
 
-```bash
+```
 python chroma_ingest.py
 ```
 
-### Run the app
+The ingestion script reads `SQLITE_DB_FULL`, builds one canonical document per paper id, chunks it with sentence aware overlap, and upserts to `CHROMA_COLLECTION_FULL` inside `CHROMA_DIR_FULL`. For the OpenAlex and abstracts datasets, use their respective ingestion pipelines (not included in this snapshot) to populate `CHROMA_DIR_OPENALEX` and `CHROMA_DIR_ABSTRACTS`.
 
-```bash
+## Running the three entry points
+
+### Streamlit web UI
+
+```
 streamlit run streamlit_app.py
 ```
+
+The sidebar exposes dataset selection, model selection, and session reset controls.
+
+### Terminal chat
+
+```
+python rag_chat.py
+python rag_chat.py --model llama-3.1-8b --db openalex
+python rag_chat.py --list
+```
+
+Use the slash commands inside the REPL to change models, switch datasets, toggle verbose output, or reset memory without exiting.
+
+### Benchmark harness
+
+```
+python benchmark_rag.py
+```
+
+Runs every `(model, database)` permutation on the built in question set and writes both JSON and text reports. Each permutation executes in an isolated subprocess.
 
 ## Runtime operations
 
@@ -1366,16 +1086,25 @@ That usually means retrieval confidence was weak or inconsistent, so the guardra
 
 ### Why reset behavior can feel stronger than chat clearing
 
-The UI reset paths clear not just visible chat history but also persistent state, caches, memory collections, and sometimes loaded runtime objects.
+The UI reset paths clear not just visible chat history but also persistent SQLite state and entries in the Chroma memory collection. Restart Conversation additionally rotates the session id so nothing from the previous conversation can leak in through anchor state.
 
 ### Why the prompt budget loop now prefers shrinking text over dropping documents
 
-The revised budget fitting strategy shrinks per document text limits first before reducing the number of documents. Having more documents in the context, even with shorter summaries, produces better grounded answers than having fewer documents with longer summaries. This is especially important for multi researcher queries where the model needs to see evidence from several different people.
+The budget fitting strategy shrinks per document text limits first before reducing the number of documents. Having more documents in the context, even with shorter summaries, produces better grounded answers than having fewer documents with longer summaries. This is especially important for multi researcher queries where the model needs to see evidence from several different people.
 
 ### Why anchor updates check the resolved question
 
-When a user asks a follow up like Summarize the mechanisms described in his papers, the raw question contains only pronouns. The resolved question after coreference rewriting contains the actual entity name. Anchor validation now checks both, preventing a dominant but unrelated researcher from noisy retrieval results from silently hijacking the conversation anchor.
+When a user asks a follow up like "summarize the mechanisms described in his papers", the raw question contains only pronouns. The resolved question after coreference rewriting contains the actual entity name. Anchor validation checks both, preventing a dominant but unrelated researcher from noisy retrieval results from silently hijacking the conversation anchor.
 
 ### Why citation validation runs after generation
 
 Small language models sometimes fabricate plausible looking paper titles and journal references when given insufficient context. The post generation citation check compares all quoted titles in the answer against the actual retrieved documents and removes lines containing fabricated references. This is a lightweight safeguard that runs without additional model calls.
+
+### Why the utility model can be unloaded while you chat
+
+When a 4 bit quantized answer model is loaded and free VRAM drops below a headroom threshold, the engine evicts the utility model and stops its worker. Query rewriting, reranking, and summary regeneration degrade gracefully. Answer generation is protected. The utility model is reloaded automatically when a lighter answer model is selected or when VRAM frees up.
+
+### Why datasets and models can be switched mid conversation
+
+Both the Streamlit sidebar and the terminal `/db` and `/model` commands go through `EngineManager.switch_mode(...)` and `EngineManager.switch_answer_model(...)`. Session state is preserved across switches because it is owned by `SessionStore`, not by the model runtime. The anchor and rolling summary travel with the user.
+
