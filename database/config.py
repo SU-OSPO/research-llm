@@ -52,7 +52,7 @@ CHROMA_ABSTRACTS_COLLECTION = _env("CHROMA_ABSTRACTS_COLLECTION", "syracuse_abst
 # ── Neo4j ─────────────────────────────────────────────────────────────────────
 NEO4J_URI      = _env("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER     = _env("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = _env("NEO4J_PASSWORD", "OSPOlol@1234")
+NEO4J_PASSWORD = _env("NEO4J_PASSWORD", "")
 NEO4J_DATABASE = _env("NEO4J_DATABASE", "syr-rag-abstracts")
 
 # ── Embedding ─────────────────────────────────────────────────────────────────
