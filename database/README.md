@@ -1,354 +1,289 @@
-# research-llm Database
+# research-llm — Ingestion & Summarization Pipeline
 
-Database branch for building a local research paper knowledge base backed by SQLite. This branch ingests PDFs, loads publication metadata from CSV exports, repairs incomplete records, tags papers with OpenAlex topics, and generates summaries for downstream LLM and retrieval workflows.
+A local pipeline that builds a research-paper knowledge base for Syracuse
+University publications and provides a summarization/chatbot workflow on top of
+it. The codebase is organized into **five files** across two independent
+projects:
+
+| File | Project | Role |
+| --- | --- | --- |
+| `config.py` | RAG | Central, environment-overridable configuration |
+| `fetch.py` | RAG | Acquire data: OpenAlex fetch/download + Docling processing |
+| `ingest.py` | RAG | Transform & index: normalize → chunk → ChromaDB / Neo4j |
+| `main.py` | RAG | Orchestrator that runs the full RAG pipeline |
+| `summarizer.py` | Summarizer | T5/LLaMA paper summarizer + chatbot (standalone) |
+
+The **RAG pipeline** (`config` + `fetch` + `ingest` + `main`) turns the OpenAlex
+API into two vector collections and a knowledge graph. The **summarizer**
+(`summarizer.py`) is a separate tool that extracts text from local PDFs into
+SQLite, summarizes it with T5, and answers questions with LLaMA.
+
+---
 
 ## Overview
 
-The codebase is organized as a set of standalone Python scripts that operate on a local SQLite database. It is designed for batch execution in a local environment rather than as a packaged application or web service.
+The RAG pipeline does four things, in order:
 
-At a high level, the pipeline does five things:
+1. **Fetch** all Syracuse works + authors from OpenAlex and download fulltexts
+2. **Process** downloaded PDFs/TEI through Docling into structured sections
+3. **Normalize** the raw records into clean, deduplicated JSONL
+4. **Index** the results into ChromaDB (full + abstract-only collections) and Neo4j
 
-1. Ingest downloaded PDFs into the database
-2. Load metadata from CSV exports into `research_info`
-3. Repair and enrich incomplete rows across tables
-4. Classify papers into OpenAlex topics
-5. Generate summaries for stored full text
+The summarizer is independent and does three things: extract PDF text into a
+SQLite `works` table, generate T5 summaries, and optionally fine-tune — plus an
+interactive LLaMA chatbot grounded in the stored summaries.
 
-## Repository Goals
-
-This branch appears intended to support a research assistant or chatbot workflow by building a structured local corpus that includes:
-
-* PDF full text
-* publication metadata
-* generated summaries
-* OpenAlex topic labels
-* formatted data for fine tuning or retrieval workflows
+---
 
 ## Architecture
 
-The pipeline revolves around three main SQLite tables.
+### Data files (RAG)
 
-### `papers`
+All paths are relative to `DATA_DIR` (default `data/`) and configurable.
 
-Stores publication level metadata such as title, authors, publication date, DOI, and arXiv ID.
+| File | Produced by | Contents |
+| --- | --- | --- |
+| `raw/works.jsonl`, `raw/authors.jsonl` | `fetch` | Raw OpenAlex records |
+| `raw/works_with_fulltext.jsonl` | `fetch` | Works + `fulltext_status` / `fulltext_path` |
+| `fulltext/{id}.tei.xml` \| `{id}.pdf` | `fetch` | Downloaded fulltexts |
+| `raw/works_with_docling.jsonl` | `fetch` | Works + `docling_status` / `docling_path` |
+| `docling/{id}.json` | `fetch` | Structured sections per work |
+| `raw/normalized_works.jsonl`, `raw/normalized_authors.jsonl` | `ingest` | Clean records |
+| `chroma_db/` (collection `syracuse_papers`) | `ingest` | Full chunked vectors |
+| `chroma_abstracts/` (collection `syracuse_abstracts`) | `ingest` | Abstract-only vectors |
+| `sync_state.json` | `fetch` | Incremental-fetch watermark |
 
-### `works`
+### Status values
 
-Stores PDF aligned work records, including file name, extracted full text, generated summary, and summarization state.
+* `fulltext_status`: `tei_xml` · `pdf` · `none`
+* `docling_status`: `docling_ok` · `fallback_pdf` · `none`
 
-### `research_info`
+### Chunk types (ChromaDB)
 
-Stores enriched metadata used for search, retrieval, researcher context, and topic tagging.
+`chunk_work()` emits: `title_abstract`, `keywords`, `section` (or
+`fallback_text` when Docling fell back to pdfminer), `table`, `figure_caption`.
+The abstract-only collection emits just `title_abstract` and `keywords`.
 
-## Processing Layers
+### Neo4j graph model
 
-### Document extraction
+* **Nodes:** `Author` · `Work` · `Topic`
+* **Edges:** `AUTHORED` (position, is_corresponding) · `HAS_TOPIC` (score) ·
+  `CITES` · `COLLABORATES_WITH` (shared_works, derived)
 
-* `pdf_pre.py`
-* `ingest_pdf_fulltext.py`
+### Summarizer database
 
-### Metadata ingestion and reconciliation
+A single SQLite `works` table: `id`, `file_name` (unique), `full_text`,
+`summary`, `summary_status` (default `unsummarized`), `progress` (default `0`).
 
-* `csv_handler.py`
-* `db_repair_enrich.py`
-
-### Semantic enrichment
-
-* `summarize_works.py`
-* `model.py`
-* `topic_tag_openalex.py`
-
-### Training data preparation
-
-* `llama_data_formatter.py`
-* `fine_tune_llama_rag.py`
-
-### Diagnostics
-
-* `db_audit`
-
-## End to End Pipeline
-
-The main orchestrator is `run_pipeline.py`.
-
-The execution order is:
-
-1. `ingest_pdf_fulltext`
-2. `csv_handler`
-3. `db_repair_enrich`
-4. `topic_tag_openalex`
-5. `summarize_works`
-
-### Why this order matters
-
-* PDF ingestion creates `works.full_text`
-* CSV ingestion adds external metadata
-* repair and enrichment reconcile missing fields across tables
-* topic tagging benefits from titles, summaries, or extracted text
-* summarization runs on records still marked as unsummarized
-
-## Expected Environment
-
-This branch assumes a local development environment with:
-
-* Python 3.x
-* SQLite database already created
-* local PDF directory already populated
-* CSV exports already downloaded
-* internet access for DOI and OpenAlex lookups in relevant stages
-* optional GPU support for heavier model workloads
+---
 
 ## Installation
 
-Create a virtual environment and install the dependencies used by the scripts.
-
 ```bash
 python -m venv .venv
-source .venv/bin/activate
-pip install pandas PyPDF2 torch transformers requests tqdm
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 ```
 
-Depending on your platform and workflow, you may also need additional packages used by specific scripts.
-
-## Running the Pipeline
+Dependencies are grouped by stage — install only what you need:
 
 ```bash
-python run_pipeline.py
+# Fetch/download
+pip install requests
+
+# Docling processing (torch optional but strongly recommended for speed)
+pip install docling pdfminer.six pypdf
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# Indexing
+pip install chromadb langchain-huggingface sentence-transformers
+
+# Neo4j (also requires a running Neo4j server)
+pip install neo4j
+
+# Summarizer
+pip install transformers datasets torch pandas pdfminer.six pypdf
 ```
 
-Useful options:
+---
+
+## Running
+
+### Full RAG pipeline
 
 ```bash
-python run_pipeline.py --limit 100
-python run_pipeline.py --skip-csv
-python run_pipeline.py --skip-repair
-python run_pipeline.py --skip-topics
-python run_pipeline.py --skip-summarize
-python run_pipeline.py --repair-t5
+python main.py                       # fetch → docling → normalize → chroma → neo4j
+python main.py --module fetch        # fetch + download only
+python main.py --module docling      # Docling only
+python main.py --module ingest       # normalize + chroma + neo4j
+python main.py --skip-download       # fetch metadata only, no PDFs
+python main.py --skip-docling        # skip Docling processing
+python main.py --skip-neo4j          # skip the graph build
+python main.py --abstracts           # also build the abstract-only collection
+python main.py --incremental         # only new/updated records
 ```
 
-## Script Reference
+### Individual stages
 
-### `run_pipeline.py`
+Each RAG file also runs standalone with its own subcommands:
 
-Runs the full local pipeline.
+```bash
+python fetch.py fetch [--incremental] [--skip-download]
+python fetch.py docling [--incremental]
+python fetch.py all [--incremental] [--skip-download]
 
-Responsibilities:
+python ingest.py normalize
+python ingest.py chroma     [--incremental]
+python ingest.py abstracts  [--incremental] [--chroma-dir DIR] [--collection NAME]
+python ingest.py neo4j      [--incremental]
+python ingest.py all        [--incremental] [--skip-neo4j] [--abstracts]
+```
 
-* checks that the configured database exists
-* verifies SQLite connectivity
-* executes the pipeline in sequence
-* supports skipping selected stages
-* supports row limiting for heavy steps
-* optionally enables a T5 based repair phase
+### Summarizer
 
-Notes:
+```bash
+python summarizer.py build-db     # extract PDF text → SQLite
+python summarizer.py summarize    # T5-summarize unsummarized works
+python summarizer.py fine-tune    # fine-tune T5 on (text, summary) pairs
+python summarizer.py pipeline     # build-db → summarize → fine-tune
+python summarizer.py chat         # interactive LLaMA chatbot over summaries
+```
 
-* database path is hard coded
-* downstream scripts are expected to exist in the working directory
-* subprocess based failures stop execution
+> `--incremental` upserts into existing collections and only processes new
+> records; without it, each stage rebuilds from scratch.
 
-### `pdf_pre.py`
+---
 
-Low level PDF extraction and cleaning utilities.
+## Module Reference
 
-Main functions:
+### `config.py`
 
-* `extract_raw_text_from_pdf(file_path)`
-* `clean_text(text)`
+Central configuration. Every value is overridable by an environment variable of
+the same name. Groups: OpenAlex (institution ID, API key, email, paging), paths,
+ChromaDB (full + abstracts), Neo4j, embedding model/device, chunking, and
+download tuning. No hardcoded paths live anywhere else in the RAG pipeline.
 
-Responsibilities:
+### `fetch.py`
 
-* open PDFs with `PyPDF2`
-* extract text page by page
-* preserve basic page boundaries
-* normalize and clean text for later processing
+Data acquisition. Two entry points:
 
-### `ingest_pdf_fulltext.py`
+* **`run_fetch(incremental=False, skip_download=False)`** — pulls works +
+  authors from OpenAlex (cursor-paginated, rate-limited), reconstructs abstracts
+  from the inverted index, and downloads fulltext per work in priority order:
+  OpenAlex TEI → open-access PDF → Unpaywall. Resumable; supports an incremental
+  watermark via `sync_state.json`.
+* **`run_docling(incremental=False)`** — runs downloaded PDFs through Docling
+  (GPU-aware) into structured sections, with a pdfminer/pypdf fallback. Safe to
+  interrupt and resume; already-processed files on disk are auto-recovered.
 
-Scans a local PDF directory, extracts text, and inserts new rows into `works`.
+### `ingest.py`
 
-Responsibilities:
+Transform & index. Entry points:
 
-* enumerate PDF files
-* skip already ingested files by `file_name`
-* extract and clean full text
-* create placeholder rows in `papers`
-* insert corresponding rows into `works`
-* optionally create stubs in `research_info`
+* **`run_normalize()`** — raw OpenAlex JSONL → normalized works/authors. Strips
+  HTML, resolves Syracuse authorship, extracts topics/keywords, and
+  auto-selects the richest available input (docling > fulltext > raw).
+* **`run_chroma(rebuild=True)`** — chunks each work (`chunk_work`) and indexes the
+  full collection into ChromaDB using normalized HuggingFace embeddings.
+* **`run_abstracts(rebuild=True, ...)`** — builds a lightweight title+abstract
+  collection (skips works whose abstract is missing or under 20 characters).
+* **`run_neo4j(rebuild=True)`** — builds the knowledge graph and derives
+  `COLLABORATES_WITH` edges in batches.
 
-Inserted `works` fields include:
+Also exposes the reusable helpers `normalize_work`, `normalize_author`, and
+`chunk_work`.
 
-* `paper_id`
-* `file_name`
-* `full_text`
-* empty summary
-* `summary_status = 'unsummarized'`
-* `progress = 0`
+### `main.py`
 
-Limitations:
+Orchestrator. Wires the stages together with `--module` selection and
+`--skip-*` / `--incremental` / `--abstracts` flags, logging timing and a summary
+per stage. Imports each stage lazily so `--help` and partial runs work without
+the heavy dependencies installed.
 
-* file name uniqueness is assumed
-* early `papers` metadata is placeholder only
-* extraction quality depends on PDF structure and `PyPDF2`
+### `summarizer.py`
 
-### `csv_handler.py`
+Standalone T5/LLaMA project. Extracts PDF text into SQLite, summarizes with T5,
+optionally fine-tunes, and serves a LLaMA chatbot over the stored summaries.
+Models and the database connection load **lazily** (on first use), so importing
+the module — or running a single subcommand — never loads both models at once.
 
-Loads several CSV exports and inserts standardized rows into `research_info`.
-
-Responsibilities:
-
-* load CSV files that exist from a configured list
-* normalize column names
-* drop duplicate columns
-* standardize fields across heterogeneous exports
-* concatenate frames
-* keep rows with at least one PDF URL
-* inspect the database schema dynamically
-* insert rows into `research_info`
-
-Important caveat:
-This script points to `researchers_all.db`, while other scripts point to `syr_research_all.db`. Unless corrected, CSV ingestion may write to a different database than the rest of the pipeline.
-
-### `database_handler.py`
-
-SQLite helper functions for summarization workflows.
-
-Responsibilities:
-
-* fetch unsummarized rows from `works`
-* update generated summaries
-* preserve compatibility with older imports
-
-The summarization contract uses rows where:
-
-* `summary_status = 'unsummarized'`
-* `progress = 0`
-* `full_text` is not null and not empty
-
-### `model.py`
-
-Implements T5 based summarization and related model utilities.
-
-Responsibilities likely include:
-
-* loading the summarization model and tokenizer
-* truncating or preparing input text
-* generating abstractive summaries
-* supporting downstream summary scripts and fine tuning workflows
-
-### `summarize_works.py`
-
-Runs the summarization pipeline over rows in `works` that are still unsummarized.
-
-Typical flow:
-
-* fetch candidate rows from `database_handler.py`
-* summarize `full_text`
-* store generated summaries back in the database
-* update status fields to mark completion
-
-### `db_repair_enrich.py`
-
-Repairs and enriches database rows across tables.
-
-This stage is responsible for filling missing fields and reconciling incomplete metadata using information already available in the database, parsed content, and optional model based extraction.
-
-This is one of the most important normalization steps in the branch.
-
-### `topic_tag_openalex.py`
-
-Classifies papers into OpenAlex topics using the OpenAlex topic classification model and related metadata lookups.
-
-Responsibilities:
-
-* infer topics from title and abstract or equivalent text
-* enrich topic labels using OpenAlex metadata
-* write topic outputs back to `research_info`
-
-Expected output fields include:
-
-* `primary_topic`
-* `topics_json`
-* `topics_status`
-* `subject`
-
-### `llama_data_formatter.py`
-
-Formats database content into training or retrieval ready records for LLaMA related workflows.
-
-This script appears intended to transform local research records into a structured dataset suitable for fine tuning, RAG preparation, or prompt based experimentation.
-
-### `fine_tune_llama_rag.py`
-
-Utility for LLaMA fine tuning or retrieval augmented generation experiments using the processed research corpus.
+---
 
 ## Data Flow
 
 ```mermaid
 flowchart TD
-    A[PDF files] --> B[ingest_pdf_fulltext.py]
-    B --> C[(papers)]
-    B --> D[(works)]
+    A[OpenAlex API] --> B[fetch.run_fetch]
+    B --> C[(raw/works.jsonl<br/>raw/authors.jsonl)]
+    B --> D[(fulltext/*.pdf | *.tei.xml)]
+    B --> E[(works_with_fulltext.jsonl)]
 
-    E[CSV exports] --> F[csv_handler.py]
-    F --> G[(research_info)]
+    E --> F[fetch.run_docling]
+    D --> F
+    F --> G[(docling/*.json)]
+    F --> H[(works_with_docling.jsonl)]
 
-    C --> H[db_repair_enrich.py]
-    D --> H
-    G --> H
-    H --> I[Reconciled and enriched records]
+    H --> I[ingest.run_normalize]
+    I --> J[(normalized_works.jsonl<br/>normalized_authors.jsonl)]
 
-    I --> J[topic_tag_openalex.py]
-    J --> K[primary_topic]
-    J --> L[topics_json]
-    J --> M[topics_status]
-    J --> N[subject]
-    K --> G
-    L --> G
-    M --> G
-    N --> G
-
-    D --> O[summarize_works.py]
-    O --> P[works.summary]
+    J --> K[ingest.run_chroma]      --> K1[[ChromaDB: syracuse_papers]]
+    J --> L[ingest.run_abstracts]   --> L1[[ChromaDB: syracuse_abstracts]]
+    J --> M[ingest.run_neo4j]       --> M1[[Neo4j graph]]
 ```
 
-A simplified data flow looks like this:
+The summarizer runs independently:
 
 ```text
-PDF files
-  -> ingest_pdf_fulltext.py
-  -> papers + works
-
-CSV exports
-  -> csv_handler.py
-  -> research_info
-
-papers + works + research_info
-  -> db_repair_enrich.py
-  -> reconciled and enriched records
-
-reconciled text and metadata
-  -> topic_tag_openalex.py
-  -> OpenAlex topic fields in research_info
-
-works.full_text
-  -> summarize_works.py
-  -> works.summary
+local PDFs
+  -> summarizer build-db   -> SQLite works.full_text
+  -> summarizer summarize  -> works.summary (T5)
+  -> summarizer fine-tune  -> fine-tuned T5
+  -> summarizer chat       -> LLaMA answers grounded in works.summary
 ```
 
-##
+---
 
-## Recommended Setup 
+## Configuration Reference
 
-To make this branch easier to maintain and run, the following changes would help:
+Set any of these as environment variables to override the defaults.
 
-1. move all paths into a `.env` file or central config module
-2. unify the database filename across scripts
-3. add schema migration or initialization scripts
-4. define a single `requirements.txt`
-5. convert the pipeline into a package with a clear entrypoint
-6. add logging instead of relying mainly on print statements
-7. document the expected table schema explicitly
+### RAG (`config.py`)
 
-##
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OPENALEX_INSTITUTION_ID` | `I70983195` | Syracuse University |
+| `OPENALEX_API_KEY` / `OPENALEX_EMAIL` | *(empty)* | OpenAlex auth / polite pool |
+| `DATA_DIR` | `data` | Root for all pipeline outputs |
+| `CHROMA_DIR` / `CHROMA_COLLECTION` | `data/chroma_db` / `syracuse_papers` | Full collection |
+| `CHROMA_ABSTRACTS_DIR` / `CHROMA_ABSTRACTS_COLLECTION` | `data/chroma_abstracts` / `syracuse_abstracts` | Abstract collection |
+| `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` / `NEO4J_DATABASE` | `bolt://localhost:7687` / `neo4j` / … / `syr-rag-abstracts` | Graph connection |
+| `EMBED_MODEL` / `EMBED_DEVICE` | `sentence-transformers/all-MiniLM-L6-v2` / `cpu` | Embeddings |
+| `CHUNK_MAX_TOKENS` / `CHUNK_OVERLAP_TOKENS` | `512` / `128` | Chunking |
+| `DOWNLOAD_WORKERS` / `DOWNLOAD_TIMEOUT` / `DOWNLOAD_MAX_RETRIES` | `8` / `30` / `3` | Download tuning |
+| `UNPAYWALL_EMAIL` | `OPENALEX_EMAIL` | Unpaywall lookups |
+
+### Summarizer (`summarizer.py`)
+
+| Variable | Default |
+| --- | --- |
+| `T5_DB_PATH` | `C:\codes\t5-db\researchers.db` |
+| `T5_PDF_FOLDER` | `C:\codes\t5-db\download_pdfs` |
+| `T5_MODEL` | `t5-small` |
+| `T5_FINETUNE_DIR` | `C:\codes\t5-db\fine_tuned_t5` |
+| `LLAMA_MODEL_PATH` | `C:\codes\llama32\Llama-3.2-1B-Instruct` |
+| `LLAMA_FINETUNE_DIR` | `C:\codes\llama32\fine_tuned_llama` |
+
+---
+
+## Notes
+
+* **Provenance.** These five files were refactored from an earlier 20-file
+  layout; overlapping/duplicate helpers were merged and colliding names
+  resolved. A verbatim archive of the original 20 files is preserved separately
+  in `consolidated_pipeline.py`.
+* **No `config_full` / `pdf_pre` needed.** The old code referenced a
+  `config_full` module and a `pdf_pre` module that were never part of the repo.
+  The RAG pipeline now uses `config.py` for everything, and the summarizer ships
+  its own `extract_text_from_pdf` (pdfminer → pypdf).
+* **Graceful degradation.** Every stage checks for its input and reports clearly
+  if a prerequisite step hasn't run; Neo4j is skipped automatically when the
+  driver isn't installed.
